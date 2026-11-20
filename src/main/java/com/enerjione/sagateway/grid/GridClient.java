@@ -14,12 +14,13 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Grid SA gateway uclari. Kimlik: mevcut Grid gateway kimligi
- * ({@code X-Gateway-Token}); yeni bir kimlik sistemi yok.
+ * Grid SA gateway uclari. SA gateway Grid'in gateway'lerinden bagimsizdir:
+ * SA modulu ile kurulur, kurulum basina tektir. Kimlik modulun kendi belirteci
+ * ({@code X-SA-Gateway-Token}).
  *
  * <pre>
- * GET  {base}/sa/gateway/{kod}/config  -> IED'ler + noktalar (bu gateway'e bagli olanlar)
- * POST {base}/sa/gateway/{kod}/values  -> deger partisi
+ * GET  {base}/sa/gateway/config  -> tum SA IED'leri + noktalari
+ * POST {base}/sa/gateway/values  -> deger partisi
  * </pre>
  */
 public final class GridClient {
@@ -53,13 +54,11 @@ public final class GridClient {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final String base;
-    private final String code;
     private final String token;
     private final HttpClient http;
 
-    public GridClient(String baseUrl, String gatewayCode, String token) {
+    public GridClient(String baseUrl, String token) {
         this.base = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
-        this.code = gatewayCode;
         this.token = token;
         // HTTP/1.1 SABIT: varsayilan HTTP/2, duz http:// uzerinde h2c yukseltmesi dener;
         // uvicorn bunu desteklemez ve POST govdesi kaybolur (yerel uctan uca denemede
@@ -71,10 +70,9 @@ public final class GridClient {
     }
 
     private HttpRequest.Builder request(String path) {
-        return HttpRequest.newBuilder(URI.create(base + "/sa/gateway/" + code + path))
+        return HttpRequest.newBuilder(URI.create(base + "/sa/gateway" + path))
                 .timeout(Duration.ofSeconds(20))
-                .header("X-Gateway-Token", token)
-                .header("X-Gateway-Code", code)
+                .header("X-SA-Gateway-Token", token)
                 .header("X-Request-Id", UUID.randomUUID().toString())
                 .header("Accept", "application/json");
     }

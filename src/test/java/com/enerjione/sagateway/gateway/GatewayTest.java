@@ -55,12 +55,12 @@ class GatewayTest {
         config = configJson(slave.port(), 1);
 
         grid = HttpServer.create(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0);
-        grid.createContext("/api/v1/sa/gateway/SAGW1/", ex -> {
+        grid.createContext("/api/v1/sa/gateway/", ex -> {
             String up = ex.getRequestHeaders().getFirst("Upgrade");
             if (up != null) upgradeHeaders.add(up);
             String body;
             int status = 200;
-            if (!TOKEN.equals(ex.getRequestHeaders().getFirst("X-Gateway-Token"))) {
+            if (!TOKEN.equals(ex.getRequestHeaders().getFirst("X-SA-Gateway-Token"))) {
                 unauthorized.incrementAndGet();
                 status = 401;
                 body = "{\"detail\":\"Invalid gateway token\"}";
@@ -93,7 +93,7 @@ class GatewayTest {
 
     private static String configJson(int port, int version) {
         return """
-                {"gateway_code":"SAGW1","config_version":"v%d","ieds":[
+                {"config_version":"v%d","ieds":[
                   {"id":1,"code":"REL1","protocol":"iec104",
                    "connection":{"host":"127.0.0.1","port":%d,"common_address":7,"originator_address":0,
                                  "k":12,"w":8,"t0":5,"t1":15,"t2":10,"t3":20,"gi_interval_sec":0,"redundant_host":null},
@@ -108,7 +108,7 @@ class GatewayTest {
 
     private SaGateway startGateway(String token) throws Exception {
         String base = "http://127.0.0.1:" + grid.getAddress().getPort() + "/api/v1";
-        gw = new SaGateway(new GridClient(base, "SAGW1", token),
+        gw = new SaGateway(new GridClient(base, token),
                 new SaGateway.Options(1, 100, 1000, 100_000, 0, ZoneOffset.UTC));
         gw.start();
         return gw;
@@ -224,7 +224,7 @@ class GatewayTest {
     @Test
     void kuyruk_dolunca_en_eski_atilir() {
         String base = "http://127.0.0.1:1/api/v1";
-        SaGateway g = new SaGateway(new GridClient(base, "SAGW1", TOKEN),
+        SaGateway g = new SaGateway(new GridClient(base, TOKEN),
                 new SaGateway.Options(60, 100, 1000, 3, 0, ZoneOffset.UTC));
         for (int i = 1; i <= 5; i++) g.enqueue(new ValueItem(i, (double) i, "good", null, "spontaneous"));
         assertEquals(3, g.queueSize());

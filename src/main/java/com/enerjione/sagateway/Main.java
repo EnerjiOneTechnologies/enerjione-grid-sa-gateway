@@ -55,7 +55,6 @@ public final class Main {
 
     private static int runGateway() throws IOException, InterruptedException {
         String url = required("E1_GRID_URL");
-        String code = required("E1_GATEWAY_CODE");
         String token = token();
         SaGateway.Options opt = new SaGateway.Options(
                 Integer.parseInt(env("E1_CONFIG_REFRESH_SEC", "60")),
@@ -64,8 +63,8 @@ public final class Main {
                 Integer.parseInt(env("E1_QUEUE_MAX", "100000")),
                 Integer.parseInt(env("E1_HEALTH_PORT", "8030")),
                 ZoneId.of(env("E1_DEVICE_TIME_ZONE", "UTC")));
-        Logger.getLogger("").info(() -> "sa_gateway_start surum=" + version() + " gateway=" + code + " grid=" + url);
-        SaGateway gw = new SaGateway(new GridClient(url, code, token), opt);
+        Logger.getLogger("").info(() -> "sa_gateway_start surum=" + version() + " grid=" + url);
+        SaGateway gw = new SaGateway(new GridClient(url, token), opt);
         CountDownLatch stop = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             gw.close();
@@ -77,11 +76,11 @@ public final class Main {
     }
 
     private static String token() throws IOException {
-        String file = System.getenv("E1_GATEWAY_TOKEN_FILE");
+        String file = System.getenv("E1_SA_TOKEN_FILE");
         if (file != null && !file.isBlank()) {
             return Files.readString(Path.of(file)).trim();
         }
-        return required("E1_GATEWAY_TOKEN");
+        return required("E1_SA_TOKEN");
     }
 
     private static String required(String name) {
@@ -106,7 +105,7 @@ public final class Main {
                   sa-gateway iec104 --host IP [--port 2404] [--ca 1] [--yedek IP] [--gi-aralik SN]
                                     [--k 12 --w 8 --t0 30 --t1 15 --t2 10 --t3 20]
                                     [--saat-dilimi UTC] [--sure SN] [--json]
-                  sa-gateway calis      (E1_GRID_URL, E1_GATEWAY_CODE, E1_GATEWAY_TOKEN[_FILE])
+                  sa-gateway calis      (E1_GRID_URL, E1_SA_TOKEN[_FILE])
                   sa-gateway surum""");
     }
 
