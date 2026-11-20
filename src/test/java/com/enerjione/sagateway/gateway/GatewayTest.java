@@ -207,6 +207,21 @@ class GatewayTest {
     }
 
     @Test
+    void sayi_olmayan_olcum_gecersiz_gider() throws Exception {
+        config = config.replace(
+                "{\"id\":13,",
+                "{\"id\":14,\"code\":\"M1/REL1/U\",\"point_type\":\"mv\",\"address\":{\"type_id\":13,\"ioa\":3001}},{\"id\":13,");
+        startGateway(TOKEN);
+        waitFor(() -> values().size() >= 2, 10000);
+        int nan = Float.floatToIntBits(Float.NaN);
+        slave.send(asdu(13, 3, 7, 3001, (byte) nan, (byte) (nan >> 8), (byte) (nan >> 16), (byte) (nan >> 24), (byte) 0));
+        waitFor(() -> values().stream().anyMatch(n -> n.path("point_id").asLong() == 14), 5000);
+        JsonNode v = values().stream().filter(n -> n.path("point_id").asLong() == 14).findFirst().orElseThrow();
+        assertTrue(v.path("value").isNull());
+        assertEquals("invalid", v.path("quality").asText());
+    }
+
+    @Test
     void kuyruk_dolunca_en_eski_atilir() {
         String base = "http://127.0.0.1:1/api/v1";
         SaGateway g = new SaGateway(new GridClient(base, "SAGW1", TOKEN),

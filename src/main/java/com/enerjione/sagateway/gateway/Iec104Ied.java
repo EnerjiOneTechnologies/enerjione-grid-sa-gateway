@@ -132,10 +132,13 @@ final class Iec104Ied implements AutoCloseable {
                         }
                         continue;
                     }
+                    // NaN / sonsuz (bozuk float olcum): Grid sayi olarak kabul etmez;
+                    // reddedilen satir noktayi eski "iyi" degerde birakirdi.
+                    boolean finite = Double.isFinite(o.value());
                     sink.accept(new ValueItem(
                             p.id(),
-                            o.value(),
-                            o.good() ? "good" : "invalid",
+                            finite ? o.value() : null,
+                            finite && o.good() ? "good" : "invalid",
                             timeOk ? o.time().toString() : null,
                             cause));
                 }
