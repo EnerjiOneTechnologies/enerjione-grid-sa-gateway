@@ -1,0 +1,308 @@
+package com.enerjione.sagateway.gateway;
+
+import com.enerjione.sagateway.grid.GridClient;
+import com.enerjione.sagateway.grid.GridClient.ValueItem;
+import com.enerjione.sagateway.iec104.Iec104Client;
+import com.enerjione.sagateway.iec104.Iec104Settings;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Gateway calisma modu: Grid'den yapilandirmayi ceker, IED baglantilarini
+ * kurar, degerleri partiler halinde Grid'e yollar.
+ *
+ * <p>Teslim kurali: Grid'e ulasmayan parti KAYBOLMAZ, kuyrugun basina geri
+ * konur ve tekrar denenir. Kuyruk sinirlidir; dolarsa en ESKI deger atilir
+ * (sayilir ve gunluge yazilir) ki bellek sinirsiz buyumesin.
+ */
+public final class SaGateway implements AutoCloseable {
+
+    private static final Logger LOG = Logger.getLogger(SaGateway.class.getName());
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** Calisma ayarlari (ortam degiskenlerinden). */
+    public record Options(int configRefreshSec, int batchMs, int batchMax, int queueMax, int healthPort,
+                          ZoneId deviceZone) {
+    }
+
+    private final GridClient grid;
+    private final Options opt;
+    private final LinkedBlockingDeque<ValueItem> queue;
+    private final Map<Long, Iec104Ied> ieds = new LinkedHashMap<>();
+    private final Set<String> unsupportedLogged = new HashSet<>();
+
+    private volatile boolean stopped;
+    private volatile String configVersion = "";
+    private volatile Instant lastConfigOk;
+    private volatile Instant lastPostOk;
+    private volatile String lastPostError = "";
+    private volatile long sent;
+    private volatile long dropped;
+    private Thread configThread;
+    private Thread postThread;
+    private HttpServer health;
+
+    public SaGateway(GridClient grid, Options opt) {
+        this.grid = grid;
+        this.opt = opt;
+        this.queue = new LinkedBlockingDeque<>();
+    }
+
+    public void start() throws IOException {
+        configThread = new Thread(this::configLoop, "sa-config");
+        configThread.setDaemon(true);
+        configThread.start();
+        postThread = new Thread(this::postLoop, "sa-post");
+        postThread.setDaemon(true);
+        postThread.start();
+        if (opt.healthPort() > 0) startHealth();
+    }
+
+    @Override
+    public void close() {
+        stopped = true;
+        if (configThread != null) configThread.interrupt();
+        if (postThread != null) postThread.interrupt();
+        synchronized (ieds) {
+            ieds.values().forEach(Iec104Ied::close);
+            ieds.clear();
+        }
+        if (health != null) health.stop(0);
+    }
+
+    // ---- kuyruk ---------------------------------------------------------------
+
+    void enqueue(ValueItem v) {
+        while (queue.size() >= opt.queueMax()) {
+            if (queue.pollFirst() == null) break;
+            long d = ++dropped;
+            if (d == 1 || d % 1000 == 0) {
+                LOG.warning(() -> "sa_queue_full dusen_toplam=" + d + " (Grid'e ulasilamiyor ya da yavas)");
+            }
+        }
+        queue.offerLast(v);
+    }
+
+    int queueSize() {
+        return queue.size();
+    }
+
+    // ---- yapilandirma ---------------------------------------------------------
+
+    private void configLoop() {
+        while (!stopped) {
+            try {
+                apply(grid.fetchConfig());
+                lastConfigOk = Instant.now();
+            } catch (InterruptedException e) {
+                return;
+            } catch (Exception e) {
+                LOG.warning(() -> "sa_config_fetch_failed " + e.getMessage()
+                        + " (mevcut baglantilar calismaya devam eder)");
+            }
+            sleep(opt.configRefreshSec() * 1000L);
+        }
+    }
+
+    /** Yapilandirmayi uygular: degisen IED yeniden kurulur, digerlerine dokunulmaz. */
+    void apply(JsonNode cfg) {
+        String version = cfg.path("config_version").asText("");
+        Map<Long, JsonNode> wanted = new HashMap<>();
+        for (JsonNode ied : cfg.path("ieds")) {
+            String protocol = ied.path("protocol").asText();
+            if (!"iec104".equals(protocol)) {
+                String c = ied.path("code").asText();
+                if (unsupportedLogged.add(c + "/" + protocol)) {
+                    LOG.info(() -> "sa_ied_protocol_not_supported ied=" + c + " protokol=" + protocol
+                            + " (bu surumde yalniz iec104)");
+                }
+                continue;
+            }
+            wanted.put(ied.path("id").asLong(), ied);
+        }
+        synchronized (ieds) {
+            for (Long id : new ArrayList<>(ieds.keySet())) {
+                JsonNode w = wanted.get(id);
+                if (w == null || !fingerprint(w).equals(ieds.get(id).fingerprint)) {
+                    Iec104Ied old = ieds.remove(id);
+                    LOG.info(() -> "sa_ied_stop ied=" + old.code + (w == null ? " (kaldirildi)" : " (degisti)"));
+                    old.close();
+                }
+            }
+            for (Map.Entry<Long, JsonNode> e : wanted.entrySet()) {
+                if (ieds.containsKey(e.getKey())) continue;
+                try {
+                    Iec104Ied ied = build(e.getValue());
+                    ieds.put(e.getKey(), ied);
+                    LOG.info(() -> "sa_ied_start ied=" + ied.code + " nokta=" + ied.pointCount());
+                    ied.start();
+                } catch (RuntimeException ex) {
+                    LOG.log(Level.WARNING, "sa_ied_config_invalid ied=" + e.getValue().path("code").asText()
+                            + " " + ex.getMessage());
+                }
+            }
+        }
+        if (!version.equals(configVersion)) {
+            LOG.info(() -> "sa_config_applied version=" + version + " ied=" + ieds.size());
+            configVersion = version;
+        }
+    }
+
+    private static String fingerprint(JsonNode ied) {
+        return ied.path("connection").toString() + "|" + ied.path("points").toString();
+    }
+
+    private Iec104Ied build(JsonNode ied) {
+        JsonNode c = ied.path("connection");
+        String redundant = c.path("redundant_host").isTextual() ? c.path("redundant_host").asText() : null;
+        Iec104Settings s = new Iec104Settings(
+                c.path("host").asText(),
+                c.path("port").asInt(2404),
+                redundant,
+                c.path("common_address").asInt(),
+                c.path("originator_address").asInt(0),
+                c.path("k").asInt(12),
+                c.path("w").asInt(8),
+                c.path("t0").asInt(30),
+                c.path("t1").asInt(15),
+                c.path("t2").asInt(10),
+                c.path("t3").asInt(20),
+                c.path("gi_interval_sec").asInt(0),
+                opt.deviceZone());
+        Map<Integer, List<Iec104Ied.PointRef>> byIoa = new HashMap<>();
+        for (JsonNode p : ied.path("points")) {
+            JsonNode a = p.path("address");
+            if (!a.has("ioa")) continue;
+            byIoa.computeIfAbsent(a.path("ioa").asInt(), k -> new ArrayList<>()).add(
+                    new Iec104Ied.PointRef(p.path("id").asLong(), p.path("code").asText(), p.path("point_type").asText()));
+        }
+        return new Iec104Ied(ied.path("id").asLong(), ied.path("code").asText(), fingerprint(ied), s, byIoa,
+                this::enqueue);
+    }
+
+    // ---- Grid'e gonderim ------------------------------------------------------
+
+    private void postLoop() {
+        long backoff = 1000;
+        while (!stopped) {
+            List<ValueItem> batch = new ArrayList<>();
+            try {
+                ValueItem first = queue.pollFirst(opt.batchMs(), TimeUnit.MILLISECONDS);
+                if (first == null) continue;
+                batch.add(first);
+                queue.drainTo(batch, opt.batchMax() - 1);
+                GridClient.PostResult r = grid.postValues(batch);
+                sent += r.accepted();
+                lastPostOk = Instant.now();
+                lastPostError = "";
+                backoff = 1000;
+                if (r.rejected() > 0) {
+                    LOG.warning(() -> "sa_values_rejected adet=" + r.rejected() + " ornek="
+                            + truncate(r.rejectedDetail().toString()));
+                }
+            } catch (InterruptedException e) {
+                requeue(batch);
+                return;
+            } catch (GridClient.GridHttpException e) {
+                lastPostError = e.getMessage();
+                if (e.permanent()) {
+                    LOG.severe(() -> "sa_values_dropped adet=" + batch.size() + " " + e.getMessage());
+                } else {
+                    requeue(batch);
+                    LOG.warning(() -> "sa_values_post_failed " + e.getMessage() + " (tekrar denenecek)");
+                    sleep(backoff);
+                    backoff = Math.min(30_000, backoff * 2);
+                }
+            } catch (IOException e) {
+                lastPostError = e.toString();
+                requeue(batch);
+                LOG.warning(() -> "sa_values_post_failed " + e + " (tekrar denenecek)");
+                sleep(backoff);
+                backoff = Math.min(30_000, backoff * 2);
+            }
+        }
+    }
+
+    private void requeue(List<ValueItem> batch) {
+        for (int i = batch.size() - 1; i >= 0; i--) {
+            queue.offerFirst(batch.get(i));
+        }
+    }
+
+    private static String truncate(String s) {
+        return s.length() > 300 ? s.substring(0, 300) + "..." : s;
+    }
+
+    private void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ---- saglik ---------------------------------------------------------------
+
+    ObjectNode healthJson() {
+        ObjectNode n = JSON.createObjectNode();
+        boolean gridOk = lastPostOk != null || (lastConfigOk != null && queue.isEmpty());
+        n.put("status", lastConfigOk != null && gridOk ? "ok" : "degraded");
+        n.put("config_version", configVersion);
+        n.put("last_config_ok", lastConfigOk == null ? null : lastConfigOk.toString());
+        n.put("last_post_ok", lastPostOk == null ? null : lastPostOk.toString());
+        n.put("last_post_error", lastPostError);
+        n.put("queue", queue.size());
+        n.put("sent", sent);
+        n.put("dropped", dropped);
+        ArrayNode arr = n.putArray("ieds");
+        synchronized (ieds) {
+            for (Iec104Ied ied : ieds.values()) {
+                Iec104Client.Status st = ied.status();
+                ObjectNode i = arr.addObject();
+                i.put("code", ied.code);
+                i.put("protocol", "iec104");
+                i.put("connected", st.connected());
+                i.put("host", st.host());
+                i.put("points", ied.pointCount());
+                i.put("asdu", st.asduCount());
+                i.put("reconnects", st.reconnects());
+                i.put("last_error", st.lastError());
+            }
+        }
+        return n;
+    }
+
+    private void startHealth() throws IOException {
+        health = HttpServer.create(new InetSocketAddress(opt.healthPort()), 0);
+        health.createContext("/health", ex -> {
+            byte[] body = healthJson().toString().getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(body);
+            }
+        });
+        health.start();
+        LOG.info(() -> "sa_health_listening port=" + opt.healthPort());
+    }
+}
