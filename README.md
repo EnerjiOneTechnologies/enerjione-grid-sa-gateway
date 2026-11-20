@@ -3,6 +3,12 @@
 Trafo merkezi IED'lerinden (koruma röleleri, RTU) izleme verisini okur ve EnerjiOne Grid'in SA
 modülüne gönderir. Komut göndermez; yalnız izleme yapar.
 
+Grid'in gateway'lerinden (Modbus / DNP3 gateway) **bağımsızdır**:
+
+- SA modülü kurulunca kendiliğinden kurulup çalışır.
+- Kurulum başına tektir ve tüm SA IED'lerine hizmet eder.
+- Grid'in Gateway'ler sayfasında görünmez; verisi SA ekranlarında görünür.
+
 | Protokol | Durum |
 |---|---|
 | IEC 60870-5-104 | **Var.** İstemci bu depoda yazıldı, dış kütüphane yok (bkz. Lisans) |
@@ -58,9 +64,8 @@ Grid'den yapılandırmayı çeker, IED bağlantılarını kurar ve değerleri pa
 
 | Ortam değişkeni | Varsayılan | Anlam |
 |---|---|---|
-| `E1_GRID_URL` | — | Örn. `https://grid.ornek.com/api/v1` |
-| `E1_GATEWAY_CODE` | — | Grid'deki gateway kaydının kodu |
-| `E1_GATEWAY_TOKEN` / `E1_GATEWAY_TOKEN_FILE` | — | Gateway belirteci. Dosyada tutmak önerilir |
+| `E1_GRID_URL` | — | Grid API'si, örn. `http://backend-api:8000/api/v1` |
+| `E1_SA_TOKEN` / `E1_SA_TOKEN_FILE` | — | SA gateway belirteci (Grid üretir; modül kurulumu verir). Dosyada tutmak önerilir |
 | `E1_CONFIG_REFRESH_SEC` | 60 | Yapılandırma yoklama aralığı |
 | `E1_BATCH_MS` / `E1_BATCH_MAX` | 500 / 1000 | Parti bekleme süresi ve boyu |
 | `E1_QUEUE_MAX` | 100000 | Grid'e ulaşılamazken bellekte tutulan değer |
@@ -68,10 +73,11 @@ Grid'den yapılandırmayı çeker, IED bağlantılarını kurar ve değerleri pa
 | `E1_HEALTH_PORT` | 8030 | `GET /health` (0 = kapalı) |
 | `E1_LOG_LEVEL` | INFO | |
 
-Grid sözleşmesi (`/api/v1/sa/gateway/{kod}/...`, kimlik `X-Gateway-Token`):
+Grid sözleşmesi (`/api/v1/sa/gateway/...`, kimlik `X-SA-Gateway-Token`):
 
-- `GET config`: bu gateway'e bağlı IED'ler (`ied.gateway_code`), bağlantı ayarları, noktalar ve
-  adresler. `config_version` değişince yalnız değişen IED yeniden kurulur.
+- `GET config`: tüm SA IED'leri, bağlantı ayarları, noktalar ve adresler. `config_version`
+  değişince yalnız değişen IED yeniden kurulur. Modül kapalıysa 404 döner; gateway bekler ve
+  yoklamayı sürdürür.
 - `POST values`: `{"values": [{"point_id", "value", "quality", "ts", "cause"}]}`.
   - `cause`: `spontaneous`, `interrogation`, `periodic`, `return`, `request` ya da `comm_lost`.
   - IED bağlantısı koparsa noktaları için `value: null, quality: invalid` gönderilir.
