@@ -2,6 +2,8 @@
 
 ## [Yayinlanmamis]
 
+## [0.3.0] - 2026-11-23
+
 ### Eklendi
 
 - Grid is kanali (Grid 2.120+): `GET /sa/gateway/jobs` ayri bir is parcaciginda 3 sn'de bir yoklanir; ayni anda tek is calisir.
