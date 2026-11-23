@@ -2,6 +2,8 @@
 
 ## [Yayinlanmamis]
 
+## [0.2.0] - 2026-11-23
+
 ### Eklendi
 
 - IEC 61850 MMS istemcisi (yalniz izleme), iec61850bean 1.9.0 (Apache-2.0) uzerinde:
