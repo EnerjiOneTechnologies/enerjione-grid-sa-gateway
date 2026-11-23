@@ -6,18 +6,22 @@
 
   <groupId>com.enerjione</groupId>
   <artifactId>enerjione-grid-sa-gateway</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <name>EnerjiOne Grid SA Gateway</name>
 
   <!--
     Bagimlilik kurali: yalniz Apache-2.0 (ya da daha serbest) lisansli kutuphane.
     GPL / LGPL / EPL eklenmez. IEC 104 istemcisi bu depoda yazildi (bkz. README).
+    IEC 61850: iec61850bean (Apache-2.0) + asn1bean (Apache-2.0) + slf4j-api (MIT).
+    iec61850bean pom'u logback-classic'i (EPL-1.0 / LGPL-2.1) runtime olarak cekiyor;
+    asagida HARIC tutulur. Istemci yolu slf4j'ye hic yazmaz, baglayici gerekmez.
   -->
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <jackson.version>2.18.2</jackson.version>
     <junit.version>5.11.4</junit.version>
+    <iec61850bean.version>1.9.0</iec61850bean.version>
   </properties>
 
   <dependencies>
@@ -26,6 +30,23 @@
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
       <version>${jackson.version}</version>
+    </dependency>
+    <!-- Apache-2.0; asn1bean (Apache-2.0) ve slf4j-api (MIT) ile gelir -->
+    <dependency>
+      <groupId>com.beanit</groupId>
+      <artifactId>iec61850bean</artifactId>
+      <version>${iec61850bean.version}</version>
+      <exclusions>
+        <!-- EPL-1.0 / LGPL-2.1: dagitilan jar'a girmez -->
+        <exclusion>
+          <groupId>ch.qos.logback</groupId>
+          <artifactId>logback-classic</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>ch.qos.logback</groupId>
+          <artifactId>logback-core</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <!-- EPL-2.0, yalniz test (dagitilan jar'a girmez) -->
     <dependency>

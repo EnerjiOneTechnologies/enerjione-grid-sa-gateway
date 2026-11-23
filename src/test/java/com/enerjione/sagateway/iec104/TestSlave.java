@@ -25,6 +25,8 @@ public final class TestSlave implements AutoCloseable {
     public final int ca;
     public final AtomicInteger connections = new AtomicInteger();
     public final AtomicInteger interrogations = new AtomicInteger();
+    /** Biten oturum sayisi (istemci kapatti ya da hat koptu). */
+    public final AtomicInteger disconnects = new AtomicInteger();
     public final AtomicInteger testfrReceived = new AtomicInteger();
     final LinkedBlockingQueue<Integer> sFrames = new LinkedBlockingQueue<>();
     public final List<byte[]> giData = new CopyOnWriteArrayList<>();
@@ -178,6 +180,8 @@ public final class TestSlave implements AutoCloseable {
                 }
             } catch (IOException e) {
                 // baglanti kapandi
+            } finally {
+                disconnects.incrementAndGet();
             }
         }
 

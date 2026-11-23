@@ -21,7 +21,7 @@ import java.util.logging.Logger;
  * cogunlukla zamansiz (M_DP_NA_1), kendiliginden degisime zamanli
  * (M_DP_TB_1) tiple yanit verir; ikisi de ayni noktadir.
  */
-final class Iec104Ied implements AutoCloseable {
+final class Iec104Ied implements IedHandler {
 
     private static final Logger LOG = Logger.getLogger(Iec104Ied.class.getName());
 
@@ -30,8 +30,8 @@ final class Iec104Ied implements AutoCloseable {
     }
 
     final long iedId;
-    final String code;
-    final String fingerprint;
+    private final String code;
+    private final String fingerprint;
     private final Iec104Settings settings;
     private final Map<Integer, List<PointRef>> byIoa;
     private final int pointCount;
@@ -54,15 +54,34 @@ final class Iec104Ied implements AutoCloseable {
         this.client = new Iec104Client(code, settings, new Listener());
     }
 
-    void start() {
+    @Override
+    public String code() {
+        return code;
+    }
+
+    @Override
+    public String protocol() {
+        return "iec104";
+    }
+
+    @Override
+    public String fingerprint() {
+        return fingerprint;
+    }
+
+    @Override
+    public void start() {
         client.start();
     }
 
-    Iec104Client.Status status() {
-        return client.status();
+    @Override
+    public Status status() {
+        Iec104Client.Status st = client.status();
+        return new Status(st.connected(), st.host(), st.asduCount(), st.reconnects(), st.lastError(), 0);
     }
 
-    int pointCount() {
+    @Override
+    public int pointCount() {
         return pointCount;
     }
 

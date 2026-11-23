@@ -1,7 +1,9 @@
 package com.enerjione.sagateway.cli;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -9,6 +11,7 @@ import java.util.Set;
 public final class Args {
 
     private final Map<String, String> values = new HashMap<>();
+    private final Map<String, List<String>> all = new HashMap<>();
     private final Set<String> flags = new HashSet<>();
 
     public Args(String[] argv, int from, Set<String> knownFlags) {
@@ -21,7 +24,9 @@ public final class Args {
                 continue;
             }
             if (i + 1 >= argv.length) throw new IllegalArgumentException("deger eksik: " + a);
-            values.put(key, argv[++i]);
+            String v = argv[++i];
+            values.put(key, v);
+            all.computeIfAbsent(key, k -> new ArrayList<>()).add(v);
         }
     }
 
@@ -43,6 +48,11 @@ public final class Args {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("--" + key + " sayi olmali: " + v);
         }
+    }
+
+    /** Tekrarlanabilen secenegin tum degerleri, verilis sirasiyla (yoksa bos). */
+    public List<String> list(String key) {
+        return List.copyOf(all.getOrDefault(key, List.of()));
     }
 
     public boolean flag(String key) {

@@ -1,6 +1,7 @@
 package com.enerjione.sagateway;
 
 import com.enerjione.sagateway.cli.Iec104Reader;
+import com.enerjione.sagateway.cli.Iec61850Reader;
 import com.enerjione.sagateway.gateway.SaGateway;
 import com.enerjione.sagateway.grid.GridClient;
 import java.io.IOException;
@@ -19,6 +20,7 @@ import java.util.logging.Logger;
  *
  * <pre>
  * sa-gateway iec104 --host ...   tek istasyonu oku, ekrana yaz (Grid'e gondermez)
+ * sa-gateway iec61850 --host ... tek IED: modeli listele ya da referanslari oku (Grid'e gondermez)
  * sa-gateway calis               gateway modu (ortam degiskenleri, bkz. README)
  * sa-gateway surum
  * </pre>
@@ -35,6 +37,7 @@ public final class Main {
         try {
             code = switch (cmd) {
                 case "iec104" -> Iec104Reader.run(args, System.out);
+                case "iec61850" -> Iec61850Reader.run(args, System.out);
                 case "calis" -> runGateway();
                 case "surum", "--version" -> {
                     System.out.println(version());
@@ -105,6 +108,10 @@ public final class Main {
                   sa-gateway iec104 --host IP [--port 2404] [--ca 1] [--yedek IP] [--gi-aralik SN]
                                     [--k 12 --w 8 --t0 30 --t1 15 --t2 10 --t3 20]
                                     [--saat-dilimi UTC] [--sure SN] [--json]
+                  sa-gateway iec61850 --host IP [--port 102]          (ref yoksa modeli listeler)
+                                    [--ref LD/LN.DO.DA --fc ST ...] [--rcb LD/LLN0.BR.ad ...]
+                                    [--yoklama MS] [--gi-yok] [--ap-title 1,1,999,1,1]
+                                    [--ae-qualifier 12] [--sure SN] [--json]
                   sa-gateway calis      (E1_GRID_URL, E1_SA_TOKEN[_FILE])
                   sa-gateway surum""");
     }

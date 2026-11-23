@@ -8,10 +8,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.beanit.iec61850bean.BdaDoubleBitPos.DoubleBitPos;
+import com.beanit.iec61850bean.BdaQuality.Validity;
 import com.enerjione.sagateway.grid.GridClient;
 import com.enerjione.sagateway.grid.GridClient.ValueItem;
 import com.enerjione.sagateway.iec104.TestSlave;
 import com.enerjione.sagateway.iec104.TypeId;
+import com.enerjione.sagateway.iec61850.TestIed;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
@@ -45,6 +48,8 @@ class GatewayTest {
     private final AtomicInteger unauthorized = new AtomicInteger();
     private final List<String> upgradeHeaders = new CopyOnWriteArrayList<>();
     private volatile String config;
+    /** /config yaniti: 200 disinda bu durum kodu doner (404 modul kapali, 403 lisans). */
+    private volatile int configStatus = 200;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -65,7 +70,12 @@ class GatewayTest {
                 status = 401;
                 body = "{\"detail\":\"Invalid gateway token\"}";
             } else if (ex.getRequestURI().getPath().endsWith("/config")) {
-                body = config;
+                if (configStatus != 200) {
+                    status = configStatus;
+                    body = "{\"detail\":\"SA module disabled\"}";
+                } else {
+                    body = config;
+                }
             } else if (failNextPosts.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                 ex.getRequestBody().readAllBytes();
                 status = 503;
@@ -102,7 +112,7 @@ class GatewayTest {
                      {"id":12,"code":"M1/REL1/Q0.Pos","point_type":"dp","address":{"type_id":31,"ioa":2001}},
                      {"id":13,"code":"M1/REL1/IL1","point_type":"mv","address":{"type_id":13,"ioa":1001}}
                    ]},
-                  {"id":2,"code":"REL2","protocol":"iec61850","connection":{"host":"127.0.0.1"},"points":[]}
+                  {"id":2,"code":"REL2","protocol":"modbus","connection":{"host":"127.0.0.1"},"points":[]}
                 ]}""".formatted(version, port);
     }
 
@@ -158,7 +168,7 @@ class GatewayTest {
 
         JsonNode h = gw.healthJson();
         assertEquals("v1", h.path("config_version").asText());
-        assertEquals(1, h.path("ieds").size()); // 61850 IED bu surumde atlanir
+        assertEquals(1, h.path("ieds").size()); // modbus IED bu surumde atlanir
         assertTrue(h.path("ieds").get(0).path("connected").asBoolean());
     }
 
@@ -219,6 +229,106 @@ class GatewayTest {
         JsonNode v = values().stream().filter(n -> n.path("point_id").asLong() == 14).findFirst().orElseThrow();
         assertTrue(v.path("value").isNull());
         assertEquals("invalid", v.path("quality").asText());
+    }
+
+    @Test
+    void modul_kapali_ya_da_lisans_gecersizse_tum_IEDler_durur() throws Exception {
+        startGateway(TOKEN);
+        waitFor(() -> values().size() >= 2, 10000);
+        assertEquals(1, gw.healthJson().path("ieds").size());
+
+        // 500: gecici Grid hatasi; mevcut baglantilar korunur.
+        configStatus = 500;
+        Thread.sleep(2500);
+        assertEquals(1, gw.healthJson().path("ieds").size());
+        assertEquals(1, slave.connections.get());
+        assertEquals(0, slave.disconnects.get());
+        assertTrue(gw.healthJson().path("module_active").asBoolean());
+
+        // 404: SA modulu kapali -> tum IED'ler kapanir, gateway bosta bekler.
+        configStatus = 404;
+        waitFor(() -> !gw.healthJson().path("module_active").asBoolean(), 5000);
+        assertEquals(0, gw.healthJson().path("ieds").size());
+        waitFor(() -> slave.disconnects.get() == 1, 5000);
+        Thread.sleep(2500); // yapilandirma yoklamasi surer ama yeniden baglanilmaz
+        assertEquals(1, slave.connections.get());
+
+        // Modul geri acilinca IED yeniden kurulur.
+        configStatus = 200;
+        waitFor(() -> slave.connections.get() == 2, 8000);
+        waitFor(() -> gw.healthJson().path("module_active").asBoolean()
+                && gw.healthJson().path("ieds").size() == 1, 5000);
+
+        // 403: lisans gecersiz -> ayni davranis.
+        configStatus = 403;
+        waitFor(() -> gw.healthJson().path("ieds").size() == 0, 5000);
+        waitFor(() -> slave.disconnects.get() == 2, 5000);
+        assertFalse(gw.healthJson().path("module_active").asBoolean());
+        configStatus = 200;
+        waitFor(() -> slave.connections.get() == 3, 8000);
+    }
+
+    @Test
+    void iec61850_IED_uctan_uca_Gride_ulasir() throws Exception {
+        try (TestIed ied = new TestIed()) {
+            config = """
+                    {"config_version":"v61850","ieds":[
+                      {"id":1,"code":"REL1","protocol":"iec104",
+                       "connection":{"host":"127.0.0.1","port":%d,"common_address":7,"originator_address":0,
+                                     "k":12,"w":8,"t0":5,"t1":15,"t2":10,"t3":20,"gi_interval_sec":0,"redundant_host":null},
+                       "points":[{"id":11,"code":"M1/REL1/K1.Alarm","point_type":"sp","address":{"type_id":1,"ioa":1001}}]},
+                      {"id":3,"code":"REL3","protocol":"iec61850",
+                       "connection":{"host":"127.0.0.1","port":%d,"ap_title":"1,1,1,999,1","ae_qualifier":12,
+                                     "report_control_blocks":["E1TESTLD0/LLN0$RP$urcbMeas"],
+                                     "gi_on_connect":true,"poll_fallback_ms":0},
+                       "points":[
+                         {"id":31,"code":"M1/REL3/Q0.Pos","point_type":"dp","address":{"ref":"E1TESTLD0/XCBR1.Pos.stVal","fc":"ST"}},
+                         {"id":32,"code":"M1/REL3/IL1","point_type":"mv","address":{"ref":"E1TESTLD0/MMXU1.A.phsA.cVal.mag.f","fc":"MX"}},
+                         {"id":33,"code":"M1/REL3/Ad","point_type":"txt","address":{"ref":"E1TESTLD0/GGIO1.Ind1.stVal","fc":"ST"}}
+                       ]}
+                    ]}""".formatted(slave.port(), ied.port());
+            startGateway(TOKEN);
+            waitFor(() -> values().stream().anyMatch(n -> n.path("point_id").asLong() == 31)
+                    && values().stream().anyMatch(n -> n.path("point_id").asLong() == 32), 15000);
+            JsonNode pos = values().stream().filter(n -> n.path("point_id").asLong() == 31).findFirst().orElseThrow();
+            assertEquals(2.0, pos.path("value").asDouble());
+            assertEquals("good", pos.path("quality").asText());
+            assertEquals("interrogation", pos.path("cause").asText());
+            assertEquals(TestIed.T0.toString(), pos.path("ts").asText());
+            JsonNode ia = values().stream().filter(n -> n.path("point_id").asLong() == 32).findFirst().orElseThrow();
+            assertEquals(12.5, ia.path("value").asDouble());
+
+            waitFor(() -> {
+                JsonNode h = gw.healthJson();
+                for (JsonNode i : h.path("ieds")) {
+                    if ("iec61850".equals(i.path("protocol").asText())) {
+                        return i.path("connected").asBoolean() && i.path("rcb_enabled").asInt() == 1;
+                    }
+                }
+                return false;
+            }, 5000);
+            Instant t = Instant.parse("2026-11-21T07:45:00.125Z");
+            ied.setPos(DoubleBitPos.OFF, Validity.GOOD, t);
+            waitFor(() -> values().stream().anyMatch(n -> n.path("point_id").asLong() == 31
+                    && "spontaneous".equals(n.path("cause").asText())), 5000);
+            JsonNode s = values().stream().filter(n -> n.path("point_id").asLong() == 31
+                    && "spontaneous".equals(n.path("cause").asText())).findFirst().orElseThrow();
+            assertEquals(1.0, s.path("value").asDouble());
+            assertEquals(t.toString(), s.path("ts").asText());
+
+            JsonNode h = gw.healthJson();
+            assertEquals(2, h.path("ieds").size());
+            assertTrue(values().stream().noneMatch(n -> n.path("point_id").asLong() == 33)); // txt gonderilmez
+            for (JsonNode i : h.path("ieds")) {
+                if ("iec61850".equals(i.path("protocol").asText())) {
+                    assertEquals(2, i.path("points").asInt());
+                    assertTrue(i.path("reports").asLong() >= 1);
+                } else {
+                    assertEquals("iec104", i.path("protocol").asText());
+                    assertTrue(i.has("asdu"));
+                }
+            }
+        }
     }
 
     @Test
