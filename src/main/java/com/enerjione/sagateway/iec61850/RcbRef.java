@@ -1,5 +1,7 @@
 package com.enerjione.sagateway.iec61850;
 
+import com.beanit.iec61850bean.Brcb;
+import com.beanit.iec61850bean.Rcb;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -29,6 +31,18 @@ public record RcbRef(String ld, String ln, boolean buffered, String name) {
                     + " (beklenen LD/LN.BR.ad ya da LD/LN$RP$ad)");
         }
         return new RcbRef(m.group(1), m.group(2), "BR".equals(m.group(3)), m.group(4));
+    }
+
+    /**
+     * bean RCB'sinin Grid adresi: {@code LD/LN.ad} -> {@code LD/LN.BR.ad} ya da
+     * {@code LD/LN.RP.ad}. Ad bean'in gordugu gibidir (numarali ornek dahil).
+     */
+    public static RcbRef of(Rcb rcb) {
+        String ref = rcb.getReference().toString();
+        int slash = ref.indexOf('/');
+        int dot = ref.lastIndexOf('.');
+        return new RcbRef(ref.substring(0, slash), ref.substring(slash + 1, dot), rcb instanceof Brcb,
+                ref.substring(dot + 1));
     }
 
     /** iec61850bean nesne referansi: {@code LD/LN.ad}. */

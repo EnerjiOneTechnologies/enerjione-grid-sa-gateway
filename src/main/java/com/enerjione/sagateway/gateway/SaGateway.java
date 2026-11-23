@@ -15,17 +15,22 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -42,6 +47,9 @@ import java.util.logging.Logger;
  * araliginda surer. Kuyruktaki degerler teslim kuralina gore tutulur (atilmaz);
  * modul donunce yeniden kurulan IED'lerin ilk okumasi onlari gunceller. Ag
  * hatasi gibi diger hatalarda mevcut baglantilar calismaya devam eder.
+ *
+ * <p>Is kanali (kesif) ayri is parcacigindadir ({@link JobWorker}); is ucunun
+ * hatasi modul durumunu etkilemez.
  */
 public final class SaGateway implements AutoCloseable {
 
@@ -58,6 +66,7 @@ public final class SaGateway implements AutoCloseable {
     private final LinkedBlockingDeque<ValueItem> queue;
     private final Map<Long, IedHandler> ieds = new LinkedHashMap<>();
     private final Set<String> unsupportedLogged = new HashSet<>();
+    private final JobWorker jobs;
 
     private volatile boolean stopped;
     private volatile String configVersion = "";
@@ -68,6 +77,19 @@ public final class SaGateway implements AutoCloseable {
     private volatile String lastPostError = "";
     private volatile long sent;
     private volatile long dropped;
+    /**
+     * Son gonderilen deger (nokta basina). Periyodik tekrar (yoklama, 104 devirli
+     * olcum, butunluk raporu) degismemisse gonderilmez: raporsuz bir IED'de her
+     * turda yuzlerce ayni deger Grid'e ve diske yuk olurdu. Bilgi icin
+     * {@link #periodicRefreshNs} dolunca yine gider. Kendiliginden rapor, genel
+     * sorgu ve baglanti kaybi HER ZAMAN gider.
+     */
+    private final ConcurrentHashMap<Long, LastSent> lastSent = new ConcurrentHashMap<>();
+    private final LongAdder suppressed = new LongAdder();
+    private volatile long periodicRefreshNs = Duration.ofMinutes(10).toNanos();
+
+    private record LastSent(Double value, String quality, long atNs) {
+    }
     private Thread configThread;
     private Thread postThread;
     private HttpServer health;
@@ -76,6 +98,17 @@ public final class SaGateway implements AutoCloseable {
         this.grid = grid;
         this.opt = opt;
         this.queue = new LinkedBlockingDeque<>();
+        this.jobs = new JobWorker(grid);
+    }
+
+    /** Testler icin: degismeyen periyodik degerin yine gonderilme araligi. */
+    void periodicRefreshMs(long ms) {
+        periodicRefreshNs = ms * 1_000_000L;
+    }
+
+    /** Testler icin: is yoklama araligi ve hata sonrasi bekleme (start'tan once). */
+    void jobIntervals(long pollMs, long backoffMs) {
+        jobs.intervals(pollMs, backoffMs);
     }
 
     public void start() throws IOException {
@@ -85,6 +118,7 @@ public final class SaGateway implements AutoCloseable {
         postThread = new Thread(this::postLoop, "sa-post");
         postThread.setDaemon(true);
         postThread.start();
+        jobs.start();
         if (opt.healthPort() > 0) startHealth();
     }
 
@@ -93,18 +127,49 @@ public final class SaGateway implements AutoCloseable {
         stopped = true;
         if (configThread != null) configThread.interrupt();
         if (postThread != null) postThread.interrupt();
+        jobs.close();
         synchronized (ieds) {
-            ieds.values().forEach(IedHandler::close);
+            closeAll(ieds.values());
             ieds.clear();
         }
         if (health != null) health.stop(0);
     }
 
+    /**
+     * IED'leri paralel kapatir ve hepsini bekler. 61850 IED'si kapanirken RCB'lerini
+     * birakir (birkac sn surebilir); sirayla kapatmak toplam sureyi IED sayisiyla buyutur.
+     */
+    private static void closeAll(Collection<IedHandler> handlers) {
+        List<Thread> ts = new ArrayList<>();
+        for (IedHandler h : handlers) ts.add(Thread.ofVirtual().name("sa-close-" + h.code()).start(h::close));
+        for (Thread t : ts) {
+            try {
+                t.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
     // ---- kuyruk ---------------------------------------------------------------
 
     void enqueue(ValueItem v) {
+        long now = System.nanoTime();
+        if ("periodic".equals(v.cause())) {
+            LastSent l = lastSent.get(v.pointId());
+            if (l != null && Objects.equals(l.value(), v.value()) && Objects.equals(l.quality(), v.quality())
+                    && now - l.atNs() < periodicRefreshNs) {
+                suppressed.increment();
+                return;
+            }
+        }
+        lastSent.put(v.pointId(), new LastSent(v.value(), v.quality(), now));
         while (queue.size() >= opt.queueMax()) {
             if (queue.pollFirst() == null) break;
+            // Dusen deger Grid'e hic ulasmadi: bellek temizlenir, siradaki turda
+            // her nokta yeniden gider (Grid eski degerde kalmaz).
+            lastSent.clear();
             long d = ++dropped;
             if (d == 1 || d % 1000 == 0) {
                 LOG.warning(() -> "sa_queue_full dusen_toplam=" + d + " (Grid'e ulasilamiyor ya da yavas)");
@@ -154,7 +219,7 @@ public final class SaGateway implements AutoCloseable {
         int closed;
         synchronized (ieds) {
             closed = ieds.size();
-            ieds.values().forEach(IedHandler::close);
+            closeAll(ieds.values());
             ieds.clear();
         }
         configVersion = "";
@@ -170,6 +235,12 @@ public final class SaGateway implements AutoCloseable {
     /** Yapilandirmayi uygular: degisen IED yeniden kurulur, digerlerine dokunulmaz. */
     void apply(JsonNode cfg) {
         String version = cfg.path("config_version").asText("");
+        // Silinen noktalarin son degeri bellekte kalmasin.
+        Set<Long> noktalar = new HashSet<>();
+        for (JsonNode ied : cfg.path("ieds")) {
+            for (JsonNode p : ied.path("points")) noktalar.add(p.path("id").asLong());
+        }
+        lastSent.keySet().retainAll(noktalar);
         Map<Long, JsonNode> wanted = new HashMap<>();
         for (JsonNode ied : cfg.path("ieds")) {
             String protocol = ied.path("protocol").asText();
@@ -184,14 +255,17 @@ public final class SaGateway implements AutoCloseable {
             wanted.put(ied.path("id").asLong(), ied);
         }
         synchronized (ieds) {
+            List<IedHandler> stop = new ArrayList<>();
             for (Long id : new ArrayList<>(ieds.keySet())) {
                 JsonNode w = wanted.get(id);
                 if (w == null || !fingerprint(w).equals(ieds.get(id).fingerprint())) {
                     IedHandler old = ieds.remove(id);
                     LOG.info(() -> "sa_ied_stop ied=" + old.code() + (w == null ? " (kaldirildi)" : " (degisti)"));
-                    old.close();
+                    stop.add(old);
                 }
             }
+            // Eskiler tamamen kapanmadan (RCB'ler birakilmadan) yenisi baslamaz.
+            closeAll(stop);
             for (Map.Entry<Long, JsonNode> e : wanted.entrySet()) {
                 if (ieds.containsKey(e.getKey())) continue;
                 try {
@@ -309,6 +383,7 @@ public final class SaGateway implements AutoCloseable {
             } catch (GridClient.GridHttpException e) {
                 lastPostError = e.getMessage();
                 if (e.permanent()) {
+                    lastSent.clear();
                     LOG.severe(() -> "sa_values_dropped adet=" + batch.size() + " " + e.getMessage());
                 } else {
                     requeue(batch);
@@ -357,7 +432,9 @@ public final class SaGateway implements AutoCloseable {
         n.put("queue", queue.size());
         n.put("sent", sent);
         n.put("dropped", dropped);
+        n.put("suppressed", suppressed.sum());
         n.put("module_active", !inactive);
+        n.set("jobs", jobs.healthJson());
         ArrayNode arr = n.putArray("ieds");
         synchronized (ieds) {
             for (IedHandler ied : ieds.values()) {
@@ -373,6 +450,7 @@ public final class SaGateway implements AutoCloseable {
                 } else {
                     i.put("reports", st.messages());
                     i.put("rcb_enabled", st.reportsEnabled());
+                    if (st.pollMs() >= 0) i.put("poll_ms", st.pollMs());
                 }
                 i.put("reconnects", st.reconnects());
                 i.put("last_error", st.lastError());

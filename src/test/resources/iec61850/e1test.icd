@@ -3,6 +3,7 @@
   Testler icin kucuk bir IED (iec61850bean ServerSap ile calisir).
   LD referansi IED adi + inst: E1TESTLD0.
   Ds1: XCBR1.Pos [ST] (DPC), MMXU1.A.phsA [MX] (WYE/CMV), GGIO1.Ind1 [ST] (SPS).
+  GGIO1.IntIn1 (INS, INT32): yalniz kesif testinde tip adi icin.
   brcbStat: tamponlu (tek ornek). urcbMeas: tamponsuz, RptEnabled max=2 -> urcbMeas01, urcbMeas02.
 -->
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B">
@@ -86,6 +87,7 @@
     <LNodeType id="E1_GGIO" lnClass="GGIO">
       <DO name="Beh" type="E1_ENS_Beh"/>
       <DO name="Ind1" type="E1_SPS"/>
+      <DO name="IntIn1" type="E1_INS"/>
     </LNodeType>
     <LNodeType id="E1_MMTR" lnClass="MMTR">
       <DO name="Beh" type="E1_ENS_Beh"/>
@@ -104,6 +106,11 @@
     </DOType>
     <DOType id="E1_SPS" cdc="SPS">
       <DA name="stVal" bType="BOOLEAN" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+    </DOType>
+    <DOType id="E1_INS" cdc="INS">
+      <DA name="stVal" bType="INT32" fc="ST" dchg="true"/>
       <DA name="q" bType="Quality" fc="ST" qchg="true"/>
       <DA name="t" bType="Timestamp" fc="ST"/>
     </DOType>
