@@ -12,7 +12,7 @@ Grid'in gateway'lerinden (Modbus / DNP3 gateway) **bağımsızdır**:
 | Protokol | Durum |
 |---|---|
 | IEC 60870-5-104 | **Var.** İstemci bu depoda yazıldı, dış kütüphane yok (bkz. Lisans) |
-| IEC 61850 | Sırada. IEC61850bean (Apache-2.0) ile IP'den model okuma ve raporlar |
+| IEC 61850 | **Var.** MMS istemcisi, iec61850bean (Apache-2.0) üzerinde: IP'den model okuma, raporlar (BRCB/URCB), yoklama yedeği |
 | Modbus TCP | Planlı (j2mod, Apache-2.0) |
 | DNP3 | Planlı (öncelik düşük) |
 
@@ -39,6 +39,84 @@ kadar), `--json`.
 ...  CA 7  IOA 3002  M_ME_TF_1  spontaneous  deger 230.75  kalite iyi  zaman 2026-11-20T06:30:42.687Z
 # genel sorgu tamamlandi
 ```
+
+## 61850 okuyucu (sahada tek başına)
+
+Bir IED'ye bağlanır. Grid'e hiçbir şey göndermez.
+
+- **`--ref` yoksa:** IED'nin modelini IP üzerinden okur ve listeler. Liste mantıksal cihazları (LD), mantıksal düğümleri (LN), veri nesnelerini (DO) ve FC'lerini içerir; ardından veri kümelerini ve rapor bloklarını Grid biçiminde verir. Devreye almada adres bulmak için kullanılır.
+- **`--ref` varsa:** verilen referansları okur ve değerleri geldikçe yazar. Değerler ilk okumadan, raporlardan ya da yoklamadan gelebilir.
+
+```bash
+docker run --rm ghcr.io/enerjionetechnologies/enerjione-grid-sa-gateway:<surum> \
+  iec61850 --host 10.0.0.7
+docker run --rm ghcr.io/enerjionetechnologies/enerjione-grid-sa-gateway:<surum> \
+  iec61850 --host 10.0.0.7 --ref AA1E01A1LD0/XCBR1.Pos.stVal --fc ST \
+  --ref AA1E01A1LD0/MMXU1.A.phsA.cVal.mag.f --fc MX --rcb AA1E01A1LD0/LLN0.RP.urcbMeas --sure 60
+```
+
+Seçenekler:
+
+- `--port 102`
+- `--ref` / `--fc`: tekrarlanabilir. Tek `--fc` verilirse tüm `--ref`'lere uygulanır.
+- `--rcb`: tekrarlanabilir.
+- `--yoklama MS`: periyodik okuma.
+- `--gi-yok`: bağlanınca rapor bloklarında GI yapılmaz.
+- `--ap-title 1,1,999,1,1` ve `--ae-qualifier 12`: IED'nin (called) değerleri.
+- `--sure SN`: 0 = durdurulana kadar.
+- `--json`
+
+Örnek çıktı:
+
+```
+# baglandi 10.0.0.7:102, 2 LD
+LD AA1E01A1LD0
+  LN XCBR1
+    Pos  [ST, CF]
+...
+# rapor bloklari (Grid bicimi)
+AA1E01A1LD0/LLN0.BR.brcbStat01  veri_kumesi=AA1E01A1LD0/LLN0$StatDs
+...  AA1E01A1LD0/XCBR1.Pos.stVal [ST]  DOUBLE_BIT_POS  spontaneous  deger ON (2)  kalite iyi  zaman 2026-11-21T08:15:30.500Z
+```
+
+## 61850 istemcisi
+
+- **Bağlantı:** MMS, TCP 102.
+  - Bağlantı ve istek yanıtı için zaman aşımı 10 sn.
+  - `ap_title` / `ae_qualifier` verilirse IED tarafına (called) uygulanır. Verilmezse iec61850bean varsayılanı gider: 1,1,999,1,1 / 12.
+  - Model (`retrieveModel`) her bağlantıda bir kez okunur.
+- **Yeniden bağlanma:** 104'teki gibi, 1 sn'den 30 sn'ye kadar artan bekleme.
+- **Yarı açık hat:** 30 sn hiç trafik olmazsa küçük bir okuma yapılır. Yanıt gelmezse bağlantı kopmuş sayılır. Böylece FIN/RST gelmeden ölen hat da fark edilir.
+- **Nokta eşleme:** `(ref, fc)` modelde aranır.
+  - Bulunamayan referans günlüğe bir kez yazılır (`sa_point_not_found`) ve Grid'e bir kez `invalid` gider.
+  - Yaprak olmayan referans (ör. DO'nun kendisi) tip uyuşmazlığı sayılır ve atlanır.
+- **İlk okuma:** bağlanınca tüm noktalar `interrogation` sebebiyle okunur.
+  - Okumalar LN altındaki üst veri nesnesine göre gruplanır; ör. `MMXU1.A` tek istekle gelir.
+  - Grup okunamazsa noktalar tek tek okunur.
+- **Raporlar:** Grid'deki RCB adresi iki biçimde olabilir: `LD/LN.BR.ad` ya da `LD/LN$RP$ad`. BR tamponlu (BRCB), RP tamponsuz (URCB) bloktur.
+  - **Örnek adı:** Ad modelde birebir yoksa aynı LN'deki numaralı örnekler sırayla denenir (`ad01`, `ad02`...). Birebir ad varken başka örneğe geçilmez; o örnek başka bir istemciye ayrılmış olabilir.
+  - **Etkinleştirme sırası:** Bloğun değerleri okunur. Başka istemcide etkinse ya da veri kümesi modelde yoksa sonraki örneğe geçilir. URCB rezerve edilir. Tetikleyicilere veri değişimi, kalite değişimi ve GI eklenir. İsteğe bağlı alanlara sıra no, rapor zamanı, veri kümesi adı ve dahil olma sebebi eklenir. Ardından blok etkinleştirilir ve `gi_on_connect` ise GI yapılır.
+  - **Ayar reddi:** IED ayar yazmayı reddederse bloktaki ayarla devam edilir.
+  - **Etkinleşmeyen blok:** günlüğe yazılır, diğerleriyle devam edilir.
+  - **Rapor sebebi:** GI raporu `interrogation`, bütünlük (integrity) raporu `periodic`, diğerleri `spontaneous` olarak gider.
+- **Yoklama yedeği:** `poll_fallback_ms > 0` ise tüm noktalar bu aralıkla okunur (`periodic`). Hiçbir blok etkinleşmese de yoklama çalışır. Rapor bloğu da yoklama da yoksa değerler yalnız bağlanınca okunur; günlüğe uyarı düşer.
+- **Değer çevirme:**
+
+| Nokta | 61850 tipi | Değer |
+|---|---|---|
+| `sp` | BOOLEAN | 1 / 0 |
+| `dp` | Dbpos | 0 ara, 1 açık (off), 2 kapalı (on), 3 bozuk |
+| `mv` | FLOAT32/64 ya da tamsayı | sayı; NaN / sonsuz → `null` + `invalid` |
+| `it` | INT64 (BCR.actVal) ya da tamsayı | sayı |
+| `st` | tamsayı / ENUM | sayı |
+| `txt` | — | gönderilmez |
+
+  Tip uymazsa değer yazılmaz ve günlüğe bir kez uyarı düşer.
+- **Kalite ve zaman:** Yaprağı taşıyan veri nesnesinin (DO ya da SDO) `q` ve `t`'si kullanılır. Örneğin `X.Pos.stVal` için `X.Pos.q`, `X.A.phsA.cVal.mag.f` için `X.A.phsA.q` alınır.
+  - **Validity:** GOOD → `good`. INVALID, QUESTIONABLE ve RESERVED → `invalid`. Test biti dikkate alınmaz.
+  - **Zaman:** `t` UTC'dir (`E1_DEVICE_TIME_ZONE` 61850'ye uygulanmaz). Yazılmamış (1970) ya da saat arızalı (ClockFailure) etikette `ts` boş gider.
+  - **Raporda olmayan q / t:** yerel modeldeki son bilinen değer kullanılır (son okuma ya da rapor). `q` hiç yoksa (ör. CF/DC) değer `good`, `ts` boş gider.
+- **Bağlantı kaybı:** Düşüş anında tüm noktalar bir kez `value: null, quality: invalid, cause: comm_lost` gönderilir. Yeniden bağlanınca ilk okuma tekrarlanır.
 
 ## 104 istemcisi
 
@@ -76,13 +154,18 @@ Grid'den yapılandırmayı çeker, IED bağlantılarını kurar ve değerleri pa
 Grid sözleşmesi (`/api/v1/sa/gateway/...`, kimlik `X-SA-Gateway-Token`):
 
 - `GET config`: tüm SA IED'leri, bağlantı ayarları, noktalar ve adresler. `config_version`
-  değişince yalnız değişen IED yeniden kurulur. Modül kapalıysa 404 döner; gateway bekler ve
-  yoklamayı sürdürür.
+  değişince yalnız değişen IED yeniden kurulur.
+  - **404 / 403:** Modül kapalıysa 404, lisans geçersizse 403 döner. Gateway bu durumda tüm IED bağlantılarını kapatır, boşta bekler ve yoklamayı normal aralıkta sürdürür. Geçiş günlüğe bir kez yazılır (`sa_module_inactive`). Kuyruktaki değerler atılmaz; modül dönünce IED'lerin ilk okuması onları günceller.
+  - **Diğer hatalar:** Ağ hatası ya da 5xx gibi durumlarda mevcut bağlantılar çalışmaya devam eder.
 - `POST values`: `{"values": [{"point_id", "value", "quality", "ts", "cause"}]}`.
   - `cause`: `spontaneous`, `interrogation`, `periodic`, `return`, `request` ya da `comm_lost`.
   - IED bağlantısı koparsa noktaları için `value: null, quality: invalid` gönderilir.
 - **Teslim:** Grid'e ulaşamayan parti kaybolmaz; kuyruğun başına konup tekrar denenir. Kuyruk
   dolarsa en eski değer atılır ve sayılır.
+
+`GET /health` IED başına `protocol`, `connected`, `points`, `reconnects` ve `last_error` verir.
+Bunlara ek olarak 104'te `asdu`, 61850'de `reports` ve `rcb_enabled` gelir. Genel alanlarda
+`module_active` da bulunur.
 
 ## Geliştirme
 
@@ -97,10 +180,32 @@ Testler (`mvn verify`):
 - **Çözücü:** tüm tipler, CP56 saat dilimi, bozuk ASDU.
 - **Test istasyonuyla gerçek TCP üzerinden:** STARTDT, genel sorgu, w/t2 onayı, t3 TESTFR, t1 zaman aşımı, sıra hatası, hat kopması, yeniden başlayan istasyon, yedek adres, periyodik genel sorgu.
 - **Uçtan uca:** test istasyonu → gateway → sahte Grid. Kapsananlar: Grid geçici hata verdiğinde değer kaybolmaması, yanlış belirteç, yapılandırma değişimi, kuyruk sınırı.
+- **Modül kapalı:** sahte Grid 404 ya da 403 döndüğünde tüm IED'ler kapanır, 200'de geri gelir. 500'de bağlantılar korunur.
+- **61850, süreç içi iec61850bean sunucusuyla:** Sunucu küçük bir SCL test dosyasından (`src/test/resources/iec61850/e1test.icd`) kurulur. Kapsananlar:
+  - ilk okumada tüm tipler
+  - rapordan gelen değişim (`spontaneous`, zaman ve kalite ile)
+  - geçersiz ve şüpheli kalite, NaN ölçüm
+  - bulunamayan referans (bir kez `invalid`)
+  - RCB olmadan yoklama
+  - sunucu durunca `comm_lost` ve yeniden bağlanma
+  - numaralı URCB örneği; ikinci istemcinin sonraki örneği alması
+  - BRCB ile URCB'nin birlikte etkinleşmesi
+  - yarı açık hattın canlılık okumasıyla fark edilmesi
+  - okuyucu (keşif ve izleme)
+  - gateway üzerinden uçtan uca
 
 **Uyumluluk:** Grid'in `iec104-outbound` sunucusuna (bağımsız yazılmış Python 104 sunucusu) karşı
 denendi. Genel sorgu, kendiliğinden ve zamanlı değerler, sayaç, kalite bitleri ve sunucu yeniden
 başlayınca geri dönme doğru çalıştı. Henüz üçüncü taraf bir cihazda (RTU / röle) denenmedi.
+
+61850 yalnız iec61850bean'in kendi sunucusuna karşı denendi; gerçek bir IED'de (ABB, Siemens vb.)
+henüz denenmedi. Bilinen sınırlar:
+
+- **BRCB:** Test sunucusu tamponlu rapor göndermez. BRCB'nin bulunup etkinleştirildiği denendi, tamponlu rapor akışı denenmedi. Bağlantı kopunca biriken tampon kayıtlarının yeniden gönderimi (EntryID ile kaldığı yerden devam) yok.
+- **Rapor sırası:** iec61850bean her raporu ayrı bir iş parçacığında verir. Arka arkaya çok hızlı gelen iki raporun sırası nadiren karışabilir; değer zaman etiketiyle (`ts`) gider.
+- **Okuma ile rapor çakışması:** Okuma yanıtı yolda iken gelen daha yeni bir rapor, yerel modelde eski okuma değeriyle ezilebilir. Bir sonraki değişim, okuma ya da GI bunu düzeltir.
+- **Model okuma:** iec61850bean model okumada veri kümesi listesinin devamını (more follows) desteklemez; çok sayıda veri kümesi olan bir LD'de bağlantı kurulamayabilir.
+- **Eski bağlantı:** Önceki bağlantıdan kalan rezerve / etkin blok IED bırakana kadar "başka istemcide" görünür.
 
 ## Lisans
 
@@ -108,3 +213,15 @@ Kapalı kaynak, EnerjiOne. Bağımlılık kuralı: yalnız Apache-2.0 ya da daha
 LGPL ve EPL olan dağıtılan jar'a girmez; JUnit (EPL) yalnız testte kullanılır.
 
 104 için GPL'li j60870 ve lib60870 bu yüzden kullanılmadı, istemci burada yazıldı.
+
+Dağıtılan jar'daki bağımlılıklar:
+
+| Kütüphane | Sürüm | Lisans |
+|---|---|---|
+| jackson-databind (+ core, annotations) | 2.18.2 | Apache-2.0 |
+| iec61850bean | 1.9.0 | Apache-2.0 |
+| asn1bean | 1.12.0 | Apache-2.0 |
+| slf4j-api | 1.7.25 | MIT |
+
+iec61850bean'in pom'u `logback-classic`'i (EPL-1.0 / LGPL-2.1) runtime olarak çeker; `pom.xml`'de
+hariç tutulur. İstemci yolu slf4j'ye hiç yazmadığı için bir slf4j bağlayıcısı da eklenmedi.

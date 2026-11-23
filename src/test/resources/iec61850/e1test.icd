@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Testler icin kucuk bir IED (iec61850bean ServerSap ile calisir).
+  LD referansi IED adi + inst: E1TESTLD0.
+  Ds1: XCBR1.Pos [ST] (DPC), MMXU1.A.phsA [MX] (WYE/CMV), GGIO1.Ind1 [ST] (SPS).
+  brcbStat: tamponlu (tek ornek). urcbMeas: tamponsuz, RptEnabled max=2 -> urcbMeas01, urcbMeas02.
+-->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B">
+  <Header id="E1TEST" nameStructure="IEDName"/>
+  <IED name="E1TEST" type="E1Test" manufacturer="EnerjiOne" configVersion="1">
+    <Services>
+      <GetDirectory/>
+      <GetDataObjectDefinition/>
+      <DataObjectDirectory/>
+      <GetDataSetValue/>
+      <DataSetDirectory/>
+      <ReadWrite/>
+      <GetCBValues/>
+      <ReportSettings cbName="Fix" datSet="Fix" rptID="Dyn" optFields="Dyn" bufTime="Dyn" trgOps="Dyn" intgPd="Dyn"/>
+    </Services>
+    <AccessPoint name="AP1">
+      <Server>
+        <Authentication none="true"/>
+        <LDevice inst="LD0">
+          <LN0 lnClass="LLN0" inst="" lnType="E1_LLN0">
+            <DataSet name="Ds1">
+              <FCDA ldInst="LD0" lnClass="XCBR" lnInst="1" doName="Pos" fc="ST"/>
+              <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A.phsA" fc="MX"/>
+              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Ind1" fc="ST"/>
+            </DataSet>
+            <ReportControl name="brcbStat" datSet="Ds1" confRev="1" buffered="true" bufTime="50"
+                           rptID="E1TESTLD0/LLN0$BR$brcbStat">
+              <TrgOps dchg="true" qchg="true" gi="true"/>
+              <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true"/>
+              <RptEnabled max="1"/>
+            </ReportControl>
+            <ReportControl name="urcbMeas" datSet="Ds1" confRev="1" buffered="false" bufTime="50">
+              <TrgOps dchg="true" qchg="true" gi="true"/>
+              <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true"/>
+              <RptEnabled max="2"/>
+            </ReportControl>
+            <DOI name="Beh">
+              <DAI name="stVal"><Val>on</Val></DAI>
+            </DOI>
+          </LN0>
+          <LN lnClass="XCBR" inst="1" lnType="E1_XCBR">
+            <DOI name="Beh">
+              <DAI name="stVal"><Val>on</Val></DAI>
+            </DOI>
+            <DOI name="Pos">
+              <DAI name="ctlModel"><Val>status-only</Val></DAI>
+            </DOI>
+          </LN>
+          <LN lnClass="MMXU" inst="1" lnType="E1_MMXU">
+            <DOI name="Beh">
+              <DAI name="stVal"><Val>on</Val></DAI>
+            </DOI>
+          </LN>
+          <LN lnClass="GGIO" inst="1" lnType="E1_GGIO">
+            <DOI name="Beh">
+              <DAI name="stVal"><Val>on</Val></DAI>
+            </DOI>
+          </LN>
+          <LN lnClass="MMTR" inst="1" lnType="E1_MMTR">
+            <DOI name="Beh">
+              <DAI name="stVal"><Val>on</Val></DAI>
+            </DOI>
+          </LN>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+  </IED>
+  <DataTypeTemplates>
+    <LNodeType id="E1_LLN0" lnClass="LLN0">
+      <DO name="Beh" type="E1_ENS_Beh"/>
+    </LNodeType>
+    <LNodeType id="E1_XCBR" lnClass="XCBR">
+      <DO name="Beh" type="E1_ENS_Beh"/>
+      <DO name="Pos" type="E1_DPC"/>
+    </LNodeType>
+    <LNodeType id="E1_MMXU" lnClass="MMXU">
+      <DO name="Beh" type="E1_ENS_Beh"/>
+      <DO name="TotW" type="E1_MV"/>
+      <DO name="A" type="E1_WYE"/>
+    </LNodeType>
+    <LNodeType id="E1_GGIO" lnClass="GGIO">
+      <DO name="Beh" type="E1_ENS_Beh"/>
+      <DO name="Ind1" type="E1_SPS"/>
+    </LNodeType>
+    <LNodeType id="E1_MMTR" lnClass="MMTR">
+      <DO name="Beh" type="E1_ENS_Beh"/>
+      <DO name="TotWh" type="E1_BCR"/>
+    </LNodeType>
+    <DOType id="E1_ENS_Beh" cdc="ENS">
+      <DA name="stVal" bType="Enum" type="BehaviourModeKind" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+    </DOType>
+    <DOType id="E1_DPC" cdc="DPC">
+      <DA name="stVal" bType="Dbpos" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+      <DA name="ctlModel" bType="Enum" type="CtlModelKind" fc="CF"/>
+    </DOType>
+    <DOType id="E1_SPS" cdc="SPS">
+      <DA name="stVal" bType="BOOLEAN" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+    </DOType>
+    <DOType id="E1_MV" cdc="MV">
+      <DA name="mag" bType="Struct" type="E1_AnalogueValue" fc="MX" dchg="true"/>
+      <DA name="q" bType="Quality" fc="MX" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="MX"/>
+    </DOType>
+    <DOType id="E1_CMV" cdc="CMV">
+      <DA name="cVal" bType="Struct" type="E1_Vector" fc="MX" dchg="true"/>
+      <DA name="q" bType="Quality" fc="MX" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="MX"/>
+    </DOType>
+    <DOType id="E1_WYE" cdc="WYE">
+      <SDO name="phsA" type="E1_CMV"/>
+      <SDO name="phsB" type="E1_CMV"/>
+    </DOType>
+    <DOType id="E1_BCR" cdc="BCR">
+      <DA name="actVal" bType="INT64" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+    </DOType>
+    <DAType id="E1_AnalogueValue">
+      <BDA name="f" bType="FLOAT32"/>
+    </DAType>
+    <DAType id="E1_Vector">
+      <BDA name="mag" bType="Struct" type="E1_AnalogueValue"/>
+    </DAType>
+    <EnumType id="BehaviourModeKind">
+      <EnumVal ord="1">on</EnumVal>
+      <EnumVal ord="2">blocked</EnumVal>
+      <EnumVal ord="3">test</EnumVal>
+      <EnumVal ord="4">test/blocked</EnumVal>
+      <EnumVal ord="5">off</EnumVal>
+    </EnumType>
+    <EnumType id="CtlModelKind">
+      <EnumVal ord="0">status-only</EnumVal>
+      <EnumVal ord="1">direct-with-normal-security</EnumVal>
+      <EnumVal ord="2">sbo-with-normal-security</EnumVal>
+      <EnumVal ord="3">direct-with-enhanced-security</EnumVal>
+      <EnumVal ord="4">sbo-with-enhanced-security</EnumVal>
+    </EnumType>
+  </DataTypeTemplates>
+</SCL>
