@@ -209,6 +209,7 @@ class Iec61850IedTest {
         waitInitial2NoInd();
         waitFor(() -> !of(UNKNOWN.id()).isEmpty(), 5000);
 
+        assertEquals("", handler.status().lastError());
         ied.stop();
         waitFor(() -> of(POS.id(), "comm_lost").size() == 1 && of(IA.id(), "comm_lost").size() == 1
                 && of(UNKNOWN.id(), "comm_lost").size() == 1, 8000);
@@ -219,11 +220,14 @@ class Iec61850IedTest {
         // Basarisiz yeniden denemeler tekrar tekrar gecersiz yollamaz.
         Thread.sleep(1500);
         assertEquals(1, of(POS.id(), "comm_lost").size());
+        assertFalse(handler.status().lastError().isEmpty());
 
         ied.start();
         waitFor(() -> of(POS.id(), "interrogation").size() >= 2 && of(IA.id(), "interrogation").size() >= 2, 20_000);
         waitFor(() -> handler.status().connected() && handler.status().reportsEnabled() == 1, 5000);
         assertTrue(handler.status().reconnects() >= 1);
+        // Baglantidayken onceki denemenin hatasi gosterilmez.
+        assertEquals("", handler.status().lastError());
         // Bilinmeyen ref yeniden baglantida tekrar "gecersiz" gonderilmez.
         assertEquals(1, of(UNKNOWN.id(), "interrogation").size());
 
@@ -253,6 +257,79 @@ class Iec61850IedTest {
             ied.setPos(DoubleBitPos.OFF, Validity.GOOD, Instant.parse("2026-11-21T12:00:00Z"));
             waitFor(() -> other.stream().anyMatch(v -> "spontaneous".equals(v.cause())), 5000);
             waitFor(() -> last(POS.id(), v -> "spontaneous".equals(v.cause())).isPresent(), 5000);
+        }
+    }
+
+    @Test
+    void mesgul_rcb_birakilinca_yeniden_denemede_etkinlesir() throws Exception {
+        try (TestIed.Client other = new TestIed.Client(ied.port())) {
+            other.enable("brcbStat"); // RptEna acik
+            other.enable("urcbMeas01"); // RptEna acik
+            other.reserve("urcbMeas02"); // yalniz rezerve: rezervasyon reddedilir
+            handler = new Iec61850Ied(1, "REL61850", "fp", base().withRcbs(List.of(BRCB, URCB)), List.of(POS),
+                    got::add);
+            handler.rcbRetryMs(300);
+            handler.start();
+            waitFor(() -> !of(POS.id(), "interrogation").isEmpty(), 15_000);
+            Thread.sleep(1000); // birkac yeniden deneme
+            assertEquals(0, handler.status().reportsEnabled());
+            assertEquals(1, of(POS.id(), "interrogation").size());
+
+            other.release("brcbStat");
+            waitFor(() -> handler.status().reportsEnabled() == 1, 5000);
+            // GI kapali: gec etkinlesmede tum noktalar yeniden okunur.
+            waitFor(() -> of(POS.id(), "interrogation").size() >= 2, 5000);
+            assertTrue(other.enabled("brcbStat")); // simdi gateway'de
+
+            other.release("urcbMeas02");
+            waitFor(() -> handler.status().reportsEnabled() == 2, 5000);
+            assertTrue(other.enabled("urcbMeas02"));
+            assertTrue(other.enabled("urcbMeas01")); // baska istemcinin blogu, dokunulmadi
+
+            Instant t = Instant.parse("2026-11-22T09:30:00Z");
+            ied.setPos(DoubleBitPos.OFF, Validity.GOOD, t);
+            waitFor(() -> last(POS.id(), v -> "spontaneous".equals(v.cause())).isPresent(), 5000);
+            assertEquals(t.toString(), last(POS.id(), v -> "spontaneous".equals(v.cause())).orElseThrow().ts());
+        }
+    }
+
+    @Test
+    void mesgul_urcb_gec_etkinlesince_GI_yapilir() throws Exception {
+        RcbRef exact = RcbRef.parse(LD + "/LLN0.RP.urcbMeas01"); // birebir ad: baska ornege gecilmez
+        try (TestIed.Client other = new TestIed.Client(ied.port())) {
+            other.enable("urcbMeas01");
+            handler = new Iec61850Ied(1, "REL61850", "fp", base().withRcbs(List.of(exact)).withGiOnConnect(true),
+                    List.of(POS, IA), got::add);
+            handler.rcbRetryMs(300);
+            handler.start();
+            waitInitial2NoInd();
+            Thread.sleep(800);
+            assertEquals(0, handler.status().reportsEnabled());
+            assertEquals(0, handler.status().messages());
+
+            other.release("urcbMeas01");
+            waitFor(() -> handler.status().reportsEnabled() == 1, 5000);
+            // Degisim olmadan gelen rapor GI raporudur; sebep "interrogation".
+            waitFor(() -> handler.status().messages() >= 1 && of(POS.id(), "interrogation").size() >= 2
+                    && of(IA.id(), "interrogation").size() >= 2, 5000);
+            assertTrue(other.enabled("urcbMeas01"));
+            assertFalse(other.enabled("urcbMeas02"));
+        }
+    }
+
+    @Test
+    void kapatilinca_RCBler_birakilir() throws Exception {
+        start(base().withRcbs(List.of(BRCB, URCB)), List.of(POS));
+        waitFor(() -> handler.status().reportsEnabled() == 2, 15_000);
+        try (TestIed.Client other = new TestIed.Client(ied.port())) {
+            assertTrue(other.enabled("brcbStat"));
+            assertTrue(other.enabled("urcbMeas01"));
+            handler.close();
+            // Bean sunucusu BRCB'yi kendiliginden hic birakmaz; URCB'yi baglanti kopunca gec birakir.
+            assertFalse(other.enabled("brcbStat"));
+            assertFalse(other.enabled("urcbMeas01"));
+            assertFalse(other.reserved("urcbMeas01"));
+            assertEquals(0, handler.status().reportsEnabled());
         }
     }
 

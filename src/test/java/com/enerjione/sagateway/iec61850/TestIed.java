@@ -7,12 +7,19 @@ import com.beanit.iec61850bean.BdaFloat32;
 import com.beanit.iec61850bean.BdaInt64;
 import com.beanit.iec61850bean.BdaQuality;
 import com.beanit.iec61850bean.BdaTimestamp;
+import com.beanit.iec61850bean.ClientAssociation;
+import com.beanit.iec61850bean.ClientEventListener;
+import com.beanit.iec61850bean.ClientSap;
 import com.beanit.iec61850bean.Fc;
+import com.beanit.iec61850bean.Rcb;
+import com.beanit.iec61850bean.Report;
 import com.beanit.iec61850bean.SclParser;
 import com.beanit.iec61850bean.ServerEventListener;
 import com.beanit.iec61850bean.ServerModel;
 import com.beanit.iec61850bean.ServerSap;
 import com.beanit.iec61850bean.ServiceError;
+import com.beanit.iec61850bean.Urcb;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -121,6 +128,71 @@ public final class TestIed implements AutoCloseable {
             st.setDoubleBitPos(pos);
             return List.of(ts, q, st);
         });
+    }
+
+    /**
+     * Ikinci istemci (SCADA benzetimi): LLN0'daki bir RCB'yi tutar / birakir ve
+     * sunucudaki durumunu (RptEna, URCB icin Resv) okur.
+     */
+    public static final class Client implements AutoCloseable {
+        private final ClientAssociation a;
+        private final ServerModel m;
+
+        public Client(int port) throws Exception {
+            ClientSap sap = new ClientSap();
+            sap.setResponseTimeout(3000);
+            a = sap.associate(InetAddress.getByName("127.0.0.1"), port, null, new ClientEventListener() {
+                @Override
+                public void newReport(Report report) {
+                    // test
+                }
+
+                @Override
+                public void associationClosed(IOException e) {
+                    // test
+                }
+            });
+            m = a.retrieveModel();
+        }
+
+        private Rcb rcb(String name) throws Exception {
+            String ref = LD + "/LLN0." + name;
+            Rcb r = m.getBrcb(ref);
+            if (r == null) r = m.getUrcb(ref);
+            if (r == null) throw new IllegalArgumentException("RCB yok: " + name);
+            a.getRcbValues(r);
+            return r;
+        }
+
+        public synchronized boolean enabled(String name) throws Exception {
+            return rcb(name).getRptEna().getValue();
+        }
+
+        public synchronized boolean reserved(String name) throws Exception {
+            return rcb(name) instanceof Urcb u && u.getResv().getValue();
+        }
+
+        /** Yalniz URCB rezervasyonu (etkinlestirmeden). */
+        public synchronized void reserve(String name) throws Exception {
+            a.reserveUrcb((Urcb) rcb(name));
+        }
+
+        public synchronized void enable(String name) throws Exception {
+            Rcb r = rcb(name);
+            if (r instanceof Urcb u) a.reserveUrcb(u);
+            a.enableReporting(r);
+        }
+
+        public synchronized void release(String name) throws Exception {
+            Rcb r = rcb(name);
+            a.disableReporting(r);
+            if (r instanceof Urcb u) a.cancelUrcbReservation(u);
+        }
+
+        @Override
+        public void close() {
+            a.close();
+        }
     }
 
     /** MMXU1.A.phsA: once t ve q, sonra cVal.mag.f. */

@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -94,10 +95,27 @@ public final class SaGateway implements AutoCloseable {
         if (configThread != null) configThread.interrupt();
         if (postThread != null) postThread.interrupt();
         synchronized (ieds) {
-            ieds.values().forEach(IedHandler::close);
+            closeAll(ieds.values());
             ieds.clear();
         }
         if (health != null) health.stop(0);
+    }
+
+    /**
+     * IED'leri paralel kapatir ve hepsini bekler. 61850 IED'si kapanirken RCB'lerini
+     * birakir (birkac sn surebilir); sirayla kapatmak toplam sureyi IED sayisiyla buyutur.
+     */
+    private static void closeAll(Collection<IedHandler> handlers) {
+        List<Thread> ts = new ArrayList<>();
+        for (IedHandler h : handlers) ts.add(Thread.ofVirtual().name("sa-close-" + h.code()).start(h::close));
+        for (Thread t : ts) {
+            try {
+                t.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     // ---- kuyruk ---------------------------------------------------------------
@@ -154,7 +172,7 @@ public final class SaGateway implements AutoCloseable {
         int closed;
         synchronized (ieds) {
             closed = ieds.size();
-            ieds.values().forEach(IedHandler::close);
+            closeAll(ieds.values());
             ieds.clear();
         }
         configVersion = "";
@@ -184,14 +202,17 @@ public final class SaGateway implements AutoCloseable {
             wanted.put(ied.path("id").asLong(), ied);
         }
         synchronized (ieds) {
+            List<IedHandler> stop = new ArrayList<>();
             for (Long id : new ArrayList<>(ieds.keySet())) {
                 JsonNode w = wanted.get(id);
                 if (w == null || !fingerprint(w).equals(ieds.get(id).fingerprint())) {
                     IedHandler old = ieds.remove(id);
                     LOG.info(() -> "sa_ied_stop ied=" + old.code() + (w == null ? " (kaldirildi)" : " (degisti)"));
-                    old.close();
+                    stop.add(old);
                 }
             }
+            // Eskiler tamamen kapanmadan (RCB'ler birakilmadan) yenisi baslamaz.
+            closeAll(stop);
             for (Map.Entry<Long, JsonNode> e : wanted.entrySet()) {
                 if (ieds.containsKey(e.getKey())) continue;
                 try {

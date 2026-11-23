@@ -331,6 +331,81 @@ class GatewayTest {
         }
     }
 
+    private static String config61850(int port, String version, String points) {
+        return config61850(port, version, 3, "T61850", points);
+    }
+
+    private static String config61850(int port, String version, int id, String code, String points) {
+        return """
+                {"config_version":"%s","ieds":[
+                  {"id":%d,"code":"%s","protocol":"iec61850",
+                   "connection":{"host":"127.0.0.1","port":%d,
+                                 "report_control_blocks":["E1TESTLD0/LLN0.BR.brcbStat","E1TESTLD0/LLN0$RP$urcbMeas"],
+                                 "gi_on_connect":true,"poll_fallback_ms":0},
+                   "points":[%s]}
+                ]}""".formatted(version, id, code, port, points);
+    }
+
+    /** Ikinci istemcinin gordugu: gateway'in kullandigi bloklar bos (RptEna kapali, rezerve degil). */
+    private static void assertRcbsFree(TestIed.Client other) throws Exception {
+        assertFalse(other.enabled("brcbStat"));
+        for (String u : List.of("urcbMeas01", "urcbMeas02")) {
+            assertFalse(other.enabled(u), u);
+            assertFalse(other.reserved(u), u);
+        }
+    }
+
+    private JsonNode ied61850() {
+        for (JsonNode i : gw.healthJson().path("ieds")) {
+            if ("iec61850".equals(i.path("protocol").asText())) return i;
+        }
+        return JSON.missingNode();
+    }
+
+    @Test
+    void iec61850_IED_degisince_ya_da_silinince_RCBler_birakilir() throws Exception {
+        String pos = "{\"id\":31,\"code\":\"M1/T/Q0.Pos\",\"point_type\":\"dp\","
+                + "\"address\":{\"ref\":\"E1TESTLD0/XCBR1.Pos.stVal\",\"fc\":\"ST\"}}";
+        String ia = "{\"id\":32,\"code\":\"M1/T/IL1\",\"point_type\":\"mv\","
+                + "\"address\":{\"ref\":\"E1TESTLD0/MMXU1.A.phsA.cVal.mag.f\",\"fc\":\"MX\"}}";
+        try (TestIed ied = new TestIed()) {
+            config = config61850(ied.port(), "v1", pos);
+            startGateway(TOKEN);
+            waitFor(() -> ied61850().path("rcb_enabled").asInt() == 2, 15000);
+            try (TestIed.Client other = new TestIed.Client(ied.port())) {
+                assertTrue(other.enabled("brcbStat"));
+                assertTrue(other.enabled("urcbMeas01"));
+                assertFalse(other.enabled("urcbMeas02"));
+
+                // Grid noktalari degistirir: IED durdurulur ve hemen yeniden kurulur.
+                config = config61850(ied.port(), "v2", pos + "," + ia);
+                waitFor(() -> ied61850().path("points").asInt() == 2
+                        && ied61850().path("rcb_enabled").asInt() == 2, 15000);
+                // Eski iliski bloklari birakti: ayni BRCB ve ayni URCB ornegi yeniden alindi.
+                assertTrue(other.enabled("brcbStat"));
+                assertTrue(other.enabled("urcbMeas01"));
+                assertFalse(other.enabled("urcbMeas02"));
+                assertFalse(other.reserved("urcbMeas02"));
+                assertTrue(ied61850().path("connected").asBoolean());
+                assertEquals("", ied61850().path("last_error").asText());
+
+                // Grid IED'yi siler: bloklar birakilir. Bean sunucusu kapanan iliskinin
+                // RptEna / Resv'ini kendiliginden hic birakmaz; birakan gateway'dir.
+                config = "{\"config_version\":\"v3\",\"ieds\":[]}";
+                waitFor(() -> gw.healthJson().path("ieds").isEmpty(), 15000);
+                assertRcbsFree(other);
+
+                // Ayni sunucuya yeni bir IED: ayni bloklari alir.
+                config = config61850(ied.port(), "v4", 4, "T61850B", pos);
+                waitFor(() -> ied61850().path("rcb_enabled").asInt() == 2, 15000);
+                assertEquals("T61850B", ied61850().path("code").asText());
+                assertTrue(other.enabled("brcbStat"));
+                assertTrue(other.enabled("urcbMeas01"));
+                assertFalse(other.enabled("urcbMeas02"));
+            }
+        }
+    }
+
     @Test
     void kuyruk_dolunca_en_eski_atilir() {
         String base = "http://127.0.0.1:1/api/v1";
