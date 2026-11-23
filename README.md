@@ -1,7 +1,27 @@
-# EnerjiOne Grid SA Gateway
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+    <img src="docs/assets/logo.png" alt="EnerjiOne" width="360">
+  </picture>
+</p>
 
-Trafo merkezi IED'lerinden (koruma röleleri, RTU) izleme verisini okur ve EnerjiOne Grid'in SA
-modülüne gönderir. Komut göndermez; yalnız izleme yapar.
+<h1 align="center">SA Gateway</h1>
+
+<p align="center">
+  Trafo merkezi IED'lerinden (koruma röleleri, RTU) izleme verisini okur<br>
+  ve EnerjiOne Grid'in SA modülüne gönderir. Komut göndermez; <b>yalnız izler</b>.
+</p>
+
+<p align="center">
+  <a href="https://github.com/EnerjiOneTechnologies/enerjione-grid-sa-gateway/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/EnerjiOneTechnologies/enerjione-grid-sa-gateway/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/EnerjiOneTechnologies/enerjione-grid-sa-gateway/releases/latest"><img alt="Sürüm notları" src="https://img.shields.io/badge/s%C3%BCr%C3%BCm%20notlar%C4%B1-e97800"></a>
+  <img alt="Java" src="https://img.shields.io/badge/java-21-0f172a">
+  <img alt="Protokol" src="https://img.shields.io/badge/protokol-IEC%20104%20%C2%B7%20IEC%2061850-0f172a">
+</p>
+
+---
+
+## Genel bakış
 
 Grid'in gateway'lerinden (Modbus / DNP3 gateway) **bağımsızdır**:
 
