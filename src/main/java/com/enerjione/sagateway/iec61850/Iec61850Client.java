@@ -26,7 +26,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -54,11 +56,23 @@ import java.util.regex.Pattern;
  * Raporlar bean'in actigi ayri is parcaciklarinda gelir (paralel olabilir); onlar
  * istek YAPMAZ, yalniz yerel modeli gunceller. Yerel model ve dinleyiciye
  * bildirim tek kilit altindadir: Grid'e yazilma sirasi model guncelleme sirasidir.
+ *
+ * <p>Bilerek durdurmada ({@link #close()}) oturum is parcacigi tuttugu RCB'leri
+ * birakir (RptEna=false, URCB rezervasyonu iptal), sonra iliskiyi kapatir: yeni
+ * iliski ayni ornekleri hemen alabilir. Baska istemcide oldugu icin etkinlesmeyen
+ * RCB'ler {@link #RCB_RETRY_MS} araligiyla yeniden denenir.
  */
 public final class Iec61850Client implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Iec61850Client.class.getName());
     private static final long MAX_BACKOFF_MS = 30_000;
+    /** Mesgul (baska istemcide) RCB'nin yeniden deneme araligi. */
+    static final long RCB_RETRY_MS = 30_000;
+    /** Birakma istekleri icin yanit zaman asimi ve toplam sure siniri. */
+    private static final int RELEASE_TIMEOUT_MS = 1000;
+    private static final long RELEASE_BUDGET_MS = 3000;
+    /** close(): oturumun RCB'leri birakmasi icin beklenen en uzun sure. */
+    private static final long CLOSE_JOIN_MS = 5000;
 
     /**
      * Baglanti ayarlari. Alanlar Grid SA'daki IEC 61850 IED baglantisiyla ayni
@@ -179,7 +193,7 @@ public final class Iec61850Client implements AutoCloseable {
 
     /** Anlik durum. */
     public record Status(boolean connected, String host, long reports, long reconnects, String lastError,
-                         int rcbEnabled) {
+                         int rcbEnabled, long pollMs) {
     }
 
     private final String name;
@@ -199,6 +213,9 @@ public final class Iec61850Client implements AutoCloseable {
     private volatile long reconnects;
     private volatile String lastError = "";
     private volatile int rcbEnabled;
+    /** Son yoklama turunun suresi (ms); yoklama yoksa -1. */
+    private volatile long lastPollMs = -1;
+    private volatile long rcbRetryMs = RCB_RETRY_MS;
 
     public Iec61850Client(String name, Settings settings, List<Target> targets, Listener listener) {
         this.name = name;
@@ -208,6 +225,11 @@ public final class Iec61850Client implements AutoCloseable {
         this.sap = newSap(settings);
     }
 
+    /** Testler icin: mesgul RCB yeniden deneme araligi (start'tan once). */
+    void rcbRetryMs(long ms) {
+        rcbRetryMs = Math.max(10, ms);
+    }
+
     public synchronized void start() {
         if (thread != null) return;
         thread = new Thread(this::runLoop, "iec61850-" + name);
@@ -215,24 +237,38 @@ public final class Iec61850Client implements AutoCloseable {
         thread.start();
     }
 
+    /**
+     * Bilerek durdurma. Iliskiyi oturum is parcacigi kapatir (once RCB'leri
+     * birakir); bean iliskisi ayni anda iki is parcacigindan kullanilmaz. Is
+     * parcacigi {@link #CLOSE_JOIN_MS} icinde bitmezse iliski zorla kapatilir.
+     */
     @Override
     public void close() {
         stopped = true;
-        Session ss = current;
-        if (ss != null) ss.close();
         Thread t = thread;
-        if (t != null) {
-            t.interrupt();
-            try {
-                t.join(5_000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+        if (t == null) return;
+        t.interrupt();
+        join(t, CLOSE_JOIN_MS);
+        if (t.isAlive()) {
+            // Baglanmamisken (ulasilamayan adrese TCP baglantisi bekleniyor) olagan; uyari degil.
+            LOG.log(connected ? Level.WARNING : Level.FINE, "iec61850_close_forced ied=" + name + " (oturum "
+                    + CLOSE_JOIN_MS + " ms icinde bitmedi, iliski zorla kapatiliyor)");
+            Session ss = current;
+            if (ss != null) ss.close();
+            join(t, 1000);
+        }
+    }
+
+    private static void join(Thread t, long ms) {
+        try {
+            t.join(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
     public Status status() {
-        return new Status(connected, s.host(), reports.get(), reconnects, lastError, rcbEnabled);
+        return new Status(connected, s.host(), reports.get(), reconnects, lastError, rcbEnabled, lastPollMs);
     }
 
     public Settings settings() {
@@ -240,8 +276,8 @@ public final class Iec61850Client implements AutoCloseable {
     }
 
     /**
-     * Tek seferlik model kesfi (CLI): baglanir, modeli ve RCB degerlerini okur,
-     * kapatir. RCB okunamazsa model yine doner.
+     * Tek seferlik model kesfi (CLI ve Grid kesif isi): baglanir, modeli ve RCB
+     * degerlerini okur, kapatir. RCB etkinlestirilmez. RCB okunamazsa model yine doner.
      */
     public static ServerModel discover(Settings settings) throws IOException, ServiceError {
         ClientAssociation a = newSap(settings).associate(InetAddress.getByName(settings.host()), settings.port(),
@@ -297,6 +333,7 @@ public final class Iec61850Client implements AutoCloseable {
                 ss.open();
                 established = true;
                 connected = true;
+                lastError = "";
                 LOG.info(() -> "iec61850_connected ied=" + name + " host=" + s.host() + ":" + s.port()
                         + " ld=" + ss.model.getChildren().size());
                 listener.onConnected(s.host(), ss.model);
@@ -310,7 +347,15 @@ public final class Iec61850Client implements AutoCloseable {
                 LOG.log(Level.SEVERE, "iec61850_unexpected ied=" + name, e);
                 reason = e.toString();
             } finally {
-                ss.close();
+                // Bilerek durdurma: tutulan RCB'ler birakilir. Beklenmedik kopmada birakilacak bir sey yok.
+                // Birakma hatasi iliskinin kapanmasini engellememeli.
+                try {
+                    if (stopped) ss.release();
+                } catch (RuntimeException e) {
+                    LOG.log(Level.FINE, "sa_rcb_release_failed ied=" + name, e);
+                } finally {
+                    ss.close();
+                }
             }
             lastError = reason == null ? "" : reason;
             if (stopped) break;
@@ -331,6 +376,7 @@ public final class Iec61850Client implements AutoCloseable {
             sleepQuietly(delay);
         }
         connected = false;
+        rcbEnabled = 0;
     }
 
     private void sleepQuietly(long ms) {
@@ -395,6 +441,28 @@ public final class Iec61850Client implements AutoCloseable {
         void run() throws IOException, ServiceError;
     }
 
+    /** Tek Grid RCB adresinin etkinlestirme sonucu. */
+    private enum RcbState {
+        ENABLED,
+        /** Baska istemci tutuyor (RptEna acik / rezervasyon ya da etkinlestirme reddi): yeniden denenir. */
+        BUSY,
+        /** Yapisal (blok yok, veri kumesi bos / modelde yok, okunamadi): yeniden denenmez. */
+        FAILED
+    }
+
+    /** tryEnable sonucu: reason null = etkin. */
+    private record Attempt(String reason, boolean busy) {
+        static final Attempt OK = new Attempt(null, false);
+
+        static Attempt busy(String reason) {
+            return new Attempt(reason, true);
+        }
+
+        static Attempt failed(String reason) {
+            return new Attempt(reason, false);
+        }
+    }
+
     // ---- tek iliski (association) oturumu ------------------------------------
 
     private final class Session implements ClientEventListener {
@@ -410,6 +478,10 @@ public final class Iec61850Client implements AutoCloseable {
         private final List<Group> groups = new ArrayList<>();
         // yalniz oturum is parcaciginda
         private final List<Rcb> enabled = new ArrayList<>();
+        /** IED'de tutabilecegimiz bloklar (rezerve URCB, etkin ya da etkinlestirilmekte olan): kapanista birakilir. */
+        private final Set<Rcb> held = new LinkedHashSet<>();
+        /** Baska istemcide oldugu icin etkinlesmeyen Grid adresleri. */
+        private final List<RcbRef> pending = new ArrayList<>();
 
         void open() throws IOException, ServiceError {
             InetAddress addr = InetAddress.getByName(s.host());
@@ -430,11 +502,14 @@ public final class Iec61850Client implements AutoCloseable {
             boolean polling = s.pollMs() > 0;
             long pollNs = s.pollMs() * 1_000_000L;
             long keepNs = s.keepAliveMs() * 1_000_000L;
+            long retryNs = rcbRetryMs * 1_000_000L;
             long nextPoll = System.nanoTime() + pollNs;
+            long nextRetry = System.nanoTime() + retryNs;
             while (!stopped) {
                 long now = System.nanoTime();
                 long waitNs = (lastActivity + keepNs) - now;
                 if (polling) waitNs = Math.min(waitNs, nextPoll - now);
+                if (!pending.isEmpty()) waitNs = Math.min(waitNs, nextRetry - now);
                 long waitMs = Math.max(1, Math.min(1000, waitNs / 1_000_000));
                 try {
                     if (closedLatch.await(waitMs, TimeUnit.MILLISECONDS)) return closeReason;
@@ -442,10 +517,25 @@ public final class Iec61850Client implements AutoCloseable {
                     return "durduruldu";
                 }
                 if (stopped) break;
+                if (!pending.isEmpty() && System.nanoTime() - nextRetry >= 0) {
+                    retryReports();
+                    nextRetry = System.nanoTime() + retryNs;
+                    if (stopped) break;
+                }
                 now = System.nanoTime();
                 if (polling && now - nextPoll >= 0) {
+                    long t0 = System.nanoTime();
                     readAll("periodic");
-                    nextPoll = System.nanoTime() + pollNs;
+                    long sure = System.nanoTime() - t0;
+                    lastPollMs = sure / 1_000_000;
+                    // Tur araliktan uzun surduyse IED'ye ara vermeden istek gitmesin:
+                    // sonraki tur en az bir tur suresi kadar bekler (IED ve ag korunur).
+                    if (sure > pollNs) {
+                        logOnce("poll_slow", Level.WARNING, "sa_poll_slow ied=" + name + " tur_ms=" + lastPollMs
+                                + " aralik_ms=" + s.pollMs() + " (sonraki tur ertelenir; noktalari azaltin ya da "
+                                + "rapor blogu kullanin)");
+                    }
+                    nextPoll = System.nanoTime() + Math.max(pollNs, sure);
                 } else if (now - (lastActivity + keepNs) >= 0) {
                     probe();
                 }
@@ -456,6 +546,49 @@ public final class Iec61850Client implements AutoCloseable {
         void close() {
             ClientAssociation a = assoc;
             if (a != null) a.close();
+        }
+
+        /**
+         * Bilerek durdurmada tutulan bloklari birakir: RptEna=false, URCB icin
+         * rezervasyon iptali. IED eski iliskinin bittigini gec fark edebilir (bean
+         * sunucusu BRCB'yi hic birakmaz); birakilmazsa yeni iliski "baska bir
+         * istemcide etkin" gorur. Sinirli: kisa yanit zaman asimi, toplam sure
+         * siniri, ilk ag hatasinda / zaman asiminda birakilir. Hatalar yok sayilir.
+         */
+        void release() {
+            ClientAssociation a = assoc;
+            if (held.isEmpty() || a == null || !a.isOpen() || closedLatch.getCount() == 0) return;
+            // close() kesmesi bayrakta kaldiysa bean ilk istegi hemen "zaman asimi" sayar.
+            Thread.interrupted();
+            a.setResponseTimeout(Math.min(s.timeoutMs(), RELEASE_TIMEOUT_MS));
+            long deadline = System.nanoTime() + RELEASE_BUDGET_MS * 1_000_000;
+            int done = 0;
+            try {
+                for (Rcb rcb : held) {
+                    if (System.nanoTime() - deadline >= 0) break;
+                    releaseCall(() -> a.disableReporting(rcb), rcb);
+                    if (rcb instanceof Urcb u) releaseCall(() -> a.cancelUrcbReservation(u), rcb);
+                    done++;
+                }
+            } catch (IOException e) {
+                LOG.fine(() -> "sa_rcb_release_aborted ied=" + name + " " + describe(e));
+            }
+            int n = done;
+            LOG.fine(() -> "sa_rcb_released ied=" + name + " blok=" + n + "/" + held.size());
+            held.clear();
+            enabled.clear();
+        }
+
+        private void releaseCall(Request r, Rcb rcb) throws IOException {
+            try {
+                r.run();
+            } catch (ServiceError e) {
+                if (e.getErrorCode() == ServiceError.TIMEOUT) throw new IOException("yanit gelmedi", e);
+                LOG.fine(() -> "sa_rcb_release_failed ied=" + name + " rcb=" + rcb.getReference() + " " + describe(e));
+            } catch (RuntimeException e) {
+                // ornek: Resv'siz URCB (bean NPE); digerleri yine birakilsin
+                LOG.fine(() -> "sa_rcb_release_failed ied=" + name + " rcb=" + rcb.getReference() + " " + e);
+            }
         }
 
         private void touch() {
@@ -531,42 +664,73 @@ public final class Iec61850Client implements AutoCloseable {
         // ---- raporlar --------------------------------------------------------
 
         private void enableReports() throws IOException {
-            int ok = 0;
             for (RcbRef r : s.rcbs()) {
-                List<Rcb> candidates = candidates(r);
-                if (candidates.isEmpty()) {
-                    logOnce("nf|" + r, Level.WARNING, "sa_rcb_not_found ied=" + name + " rcb=" + r
-                            + " (modelde yok; yoklama " + (s.pollMs() > 0 ? "var" : "YOK") + ")");
-                    continue;
-                }
-                Rcb done = null;
-                String fail = null;
-                for (Rcb rcb : candidates) {
-                    String err = tryEnable(rcb);
-                    if (err == null) {
-                        done = rcb;
-                        break;
-                    }
-                    fail = rcb.getReference() + ": " + err;
-                }
-                if (done != null) {
-                    ok++;
-                    loggedOnce.remove("ef|" + r);
-                    Rcb d = done;
-                    LOG.info(() -> "sa_rcb_enabled ied=" + name + " rcb=" + d.getReference()
-                            + (d instanceof Brcb ? " (BR)" : " (RP)") + " veri_kumesi=" + d.getDatSet().getStringValue());
-                } else {
-                    logOnce("ef|" + r, Level.WARNING, "sa_rcb_enable_failed ied=" + name + " rcb=" + r
-                            + " sebep=" + fail);
-                }
+                if (enableRef(r, false) == RcbState.BUSY) pending.add(r);
             }
-            rcbEnabled = ok;
-            if (ok == 0 && !s.rcbs().isEmpty()) {
+            rcbEnabled = enabled.size();
+            if (enabled.isEmpty() && !s.rcbs().isEmpty()) {
                 logOnce("none", Level.WARNING, "sa_rcb_none_enabled ied=" + name + " (hicbir rapor blogu "
-                        + "etkinlesmedi; yoklama " + (s.pollMs() > 0 ? s.pollMs() + " ms" : "KAPALI") + ")");
-            } else if (ok > 0) {
+                        + "etkinlesmedi; yoklama " + (s.pollMs() > 0 ? s.pollMs() + " ms" : "KAPALI")
+                        + (pending.isEmpty() ? "" : "; mesgul bloklar yeniden denenecek") + ")");
+            } else if (!enabled.isEmpty()) {
                 loggedOnce.remove("none");
             }
+        }
+
+        /** Tek Grid adresi: adaylar sirayla denenir, ilk etkinlesen kullanilir. */
+        private RcbState enableRef(RcbRef r, boolean retry) throws IOException {
+            List<Rcb> candidates = candidates(r);
+            if (candidates.isEmpty()) {
+                logOnce("nf|" + r, Level.WARNING, "sa_rcb_not_found ied=" + name + " rcb=" + r
+                        + " (modelde yok; yoklama " + (s.pollMs() > 0 ? "var" : "YOK") + ")");
+                return RcbState.FAILED;
+            }
+            String fail = null;
+            boolean busy = false;
+            for (Rcb rcb : candidates) {
+                if (enabled.contains(rcb)) {
+                    // Grid'de ayni blok iki adresle verilmis; ikincisi icin mesgul sayilmaz.
+                    fail = rcb.getReference() + ": bu baglantida baska bir adresle zaten etkin";
+                    continue;
+                }
+                Attempt at = tryEnable(rcb);
+                if (at.reason() == null) {
+                    loggedOnce.remove("ef|" + r);
+                    LOG.info(() -> "sa_rcb_enabled ied=" + name + " rcb=" + rcb.getReference()
+                            + (rcb instanceof Brcb ? " (BR)" : " (RP)") + " veri_kumesi="
+                            + rcb.getDatSet().getStringValue() + (retry ? " (yeniden deneme)" : ""));
+                    return RcbState.ENABLED;
+                }
+                busy |= at.busy();
+                fail = rcb.getReference() + ": " + at.reason();
+            }
+            String f = fail;
+            boolean b = busy;
+            logOnce("ef|" + r, Level.WARNING, "sa_rcb_enable_failed ied=" + name + " rcb=" + r + " sebep=" + f
+                    + (b ? " (" + rcbRetryMs / 1000 + " sn'de bir yeniden denenir)" : ""));
+            return busy ? RcbState.BUSY : RcbState.FAILED;
+        }
+
+        /**
+         * Mesgul bloklari yeniden dener. Gec etkinlesen blokta arada kacan degisim
+         * olmasin diye gi_on_connect ise GI yapilir, degilse (ya da GI olmazsa)
+         * tum noktalar okunur.
+         */
+        private void retryReports() throws IOException {
+            List<Rcb> fresh = new ArrayList<>();
+            for (Iterator<RcbRef> it = pending.iterator(); it.hasNext() && !stopped; ) {
+                RcbState st = enableRef(it.next(), true);
+                if (st != RcbState.BUSY) it.remove();
+                if (st == RcbState.ENABLED) fresh.add(enabled.get(enabled.size() - 1));
+            }
+            if (fresh.isEmpty()) return;
+            rcbEnabled = enabled.size();
+            loggedOnce.remove("none");
+            boolean gi = s.giOnConnect();
+            for (Rcb rcb : fresh) {
+                if (gi && !startGi(rcb)) gi = false;
+            }
+            if (!gi) readAll("interrogation");
         }
 
         /**
@@ -593,23 +757,29 @@ public final class Iec61850Client implements AutoCloseable {
             return found;
         }
 
-        /** null = etkin; aksi halde neden. IOException hat kopuk demektir. */
-        private String tryEnable(Rcb rcb) throws IOException {
+        /** IOException hat kopuk demektir. */
+        private Attempt tryEnable(Rcb rcb) throws IOException {
             boolean buffered = rcb instanceof Brcb;
             try {
                 call(() -> assoc.getRcbValues(rcb));
                 if (rcb.getRptEna() != null && rcb.getRptEna().getValue()) {
-                    return "baska bir istemcide etkin";
+                    return Attempt.busy("baska bir istemcide etkin");
                 }
                 String ds = rcb.getDatSet() == null ? null : rcb.getDatSet().getStringValue();
-                if (ds == null || ds.isEmpty()) return "veri kumesi (DatSet) bos";
+                if (ds == null || ds.isEmpty()) return Attempt.failed("veri kumesi (DatSet) bos");
                 // Veri kumesi modelde yoksa bean gelen raporu cozemez ve iliskiyi KAPATIR.
-                if (model.getDataSet(ds.replace('$', '.')) == null) return "veri kumesi modelde yok: " + ds;
+                if (model.getDataSet(ds.replace('$', '.')) == null) {
+                    return Attempt.failed("veri kumesi modelde yok: " + ds);
+                }
+                // Yanit gelmeden kesilen istek IED'de uygulanmis olabilir: kapanista birakilsin.
+                // Reddedilirse listeden cikar; baska istemcinin blogu birakilmaz.
+                held.add(rcb);
                 if (!buffered) {
                     try {
                         call(() -> assoc.reserveUrcb((Urcb) rcb));
                     } catch (ServiceError e) {
-                        return "rezerve edilemedi (baska istemcide olabilir): " + describe(e);
+                        held.remove(rcb);
+                        return Attempt.busy("rezerve edilemedi (baska istemcide olabilir): " + describe(e));
                     }
                 }
                 try {
@@ -617,12 +787,13 @@ public final class Iec61850Client implements AutoCloseable {
                     call(() -> assoc.enableReporting(rcb));
                 } catch (ServiceError e) {
                     if (!buffered) cancelQuietly((Urcb) rcb);
-                    return "etkinlestirilemedi: " + describe(e);
+                    held.remove(rcb);
+                    return Attempt.busy("etkinlestirilemedi: " + describe(e));
                 }
                 enabled.add(rcb);
-                return null;
+                return Attempt.OK;
             } catch (ServiceError e) {
-                return describe(e);
+                return Attempt.failed(describe(e));
             }
         }
 
@@ -698,12 +869,16 @@ public final class Iec61850Client implements AutoCloseable {
         }
 
         private void startGi() throws IOException {
-            for (Rcb rcb : enabled) {
-                try {
-                    call(() -> assoc.startGi(rcb));
-                } catch (ServiceError e) {
-                    LOG.fine(() -> "sa_rcb_gi_failed ied=" + name + " rcb=" + rcb.getReference() + " " + describe(e));
-                }
+            for (Rcb rcb : enabled) startGi(rcb);
+        }
+
+        private boolean startGi(Rcb rcb) throws IOException {
+            try {
+                call(() -> assoc.startGi(rcb));
+                return true;
+            } catch (ServiceError e) {
+                LOG.fine(() -> "sa_rcb_gi_failed ied=" + name + " rcb=" + rcb.getReference() + " " + describe(e));
+                return false;
             }
         }
 

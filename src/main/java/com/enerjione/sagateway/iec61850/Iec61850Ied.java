@@ -108,10 +108,16 @@ public final class Iec61850Ied implements IedHandler {
         client.start();
     }
 
+    /** Testler icin: mesgul RCB yeniden deneme araligi (start'tan once). */
+    void rcbRetryMs(long ms) {
+        client.rcbRetryMs(ms);
+    }
+
     @Override
     public Status status() {
         Iec61850Client.Status st = client.status();
-        return new Status(st.connected(), st.host(), st.reports(), st.reconnects(), st.lastError(), st.rcbEnabled());
+        return new Status(st.connected(), st.host(), st.reports(), st.reconnects(), st.lastError(), st.rcbEnabled(),
+                st.pollMs());
     }
 
     @Override

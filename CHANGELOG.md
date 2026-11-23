@@ -2,6 +2,29 @@
 
 ## [Yayinlanmamis]
 
+## [0.3.0] - 2026-11-23
+
+### Eklendi
+
+- Grid is kanali (Grid 2.120+): `GET /sa/gateway/jobs` ayri bir is parcaciginda 3 sn'de bir yoklanir; ayni anda tek is calisir.
+  - `iec61850_discover`: IED'nin modeli ve RCB degerleri okunur (RCB etkinlestirilmez); sonuc `POST /sa/gateway/jobs/{id}/result` ile gider.
+  - Dugumler yalniz ST / MX yapraklaridir (en fazla 50 000, asilirsa `truncated`). Veri kumeleri noktali, RCB adresi Grid bicimindedir.
+  - Hata `ok: false` ve kisa ozetle (en fazla 300 karakter) doner; bilinmeyen tur "desteklenmeyen is turu" ile doner.
+  - Is ucunun 404 / 401 / 403 / 5xx / ag hatasi modulu kapatmaz; yalniz is yoklamasi 60 sn'ye seyrelir.
+- `/health`: `jobs` alani (`last_id`, `last_status`, `last_at`, `poll_error`).
+- Tekrar bastirma: `periodic` deger (raporsuz IED yoklamasi, 104 devirli olcum, butunluk raporu) son gonderilenle ayniysa Grid'e gitmez; ayni deger 10 dk'da bir yine gider. Kendiliginden rapor, genel sorgu ve baglanti kaybi her zaman gider; kuyruk tasip deger duserse bellek temizlenir. Raporsuz 1116 sinyallik IED'de Grid'e giden deger saniyede ~220'den yalniz degisenlere indi. `/health` `suppressed`.
+- 61850 yoklama turu korumasi: tur araliktan uzun surerse sonraki tur en az tur suresi kadar bekler (`sa_poll_slow` bir kez); `/health` `poll_ms`.
+
+### Duzeltildi
+
+- 61850: IED degisince, silinince ya da gateway dururken RCB'ler birakilir (RptEna=false, URCB rezervasyon iptali), sonra iliski kapanir. Onceden yeni iliski BRCB'yi "baska bir istemcide etkin" gorup etkinlestiremiyor, URCB sonraki ornege (urcbMeas02) kayiyordu.
+- 61850: Baska istemcide oldugu icin etkinlesmeyen RCB 30 sn'de bir yeniden denenir. Gec etkinlesmede GI yapilir ya da tum noktalar okunur. Yapisal hatalar (blok yok, veri kumesi bos / modelde yok) yeniden denenmez.
+- 61850: `/health` `last_error` baglanti kurulunca temizlenir; `rcb_enabled` anlik sayiyi gosterir.
+
+### Degisti
+
+- Gateway IED'leri paralel kapatir; degisen IED'nin yenisi eskisi kapandiktan sonra baslar.
+
 ## [0.2.0] - 2026-11-23
 
 ### Eklendi
