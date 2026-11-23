@@ -25,6 +25,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
@@ -50,6 +52,13 @@ class GatewayTest {
     private volatile String config;
     /** /config yaniti: 200 disinda bu durum kodu doner (404 modul kapali, 403 lisans). */
     private volatile int configStatus = 200;
+    /** /jobs yaniti: 200 disinda bu durum kodu doner (404 eski Grid). */
+    private volatile int jobsStatus = 200;
+    /** Sirayla verilecek isler (yoklama basina en fazla bir). */
+    private final Queue<String> jobQueue = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger jobPolls = new AtomicInteger();
+    private final List<String> jobResultPaths = new CopyOnWriteArrayList<>();
+    private final List<JsonNode> jobResults = new CopyOnWriteArrayList<>();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -76,6 +85,19 @@ class GatewayTest {
                 } else {
                     body = config;
                 }
+            } else if (ex.getRequestURI().getPath().endsWith("/jobs")) {
+                jobPolls.incrementAndGet();
+                if (jobsStatus != 200) {
+                    status = jobsStatus;
+                    body = "{\"detail\":\"Not Found\"}";
+                } else {
+                    String j = jobQueue.poll();
+                    body = "{\"jobs\":[" + (j == null ? "" : j) + "]}";
+                }
+            } else if (ex.getRequestURI().getPath().endsWith("/result")) {
+                jobResults.add(JSON.readTree(ex.getRequestBody()));
+                jobResultPaths.add(ex.getRequestURI().getPath());
+                body = "{\"accepted\":true}";
             } else if (failNextPosts.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                 ex.getRequestBody().readAllBytes();
                 status = 503;
@@ -120,6 +142,7 @@ class GatewayTest {
         String base = "http://127.0.0.1:" + grid.getAddress().getPort() + "/api/v1";
         gw = new SaGateway(new GridClient(base, token),
                 new SaGateway.Options(1, 100, 1000, 100_000, 0, ZoneOffset.UTC));
+        gw.jobIntervals(200, 60_000);
         gw.start();
         return gw;
     }
@@ -404,6 +427,154 @@ class GatewayTest {
                 assertFalse(other.enabled("urcbMeas02"));
             }
         }
+    }
+
+    private static String discoverJob(long id, int port) {
+        return """
+                {"id":%d,"kind":"iec61850_discover",
+                 "params":{"host":"127.0.0.1","port":%d,"ap_title":null,"ae_qualifier":null,"timeout_ms":3000}}"""
+                .formatted(id, port);
+    }
+
+    private static JsonNode find(JsonNode arr, String ref) {
+        for (JsonNode n : arr) {
+            if (ref.equals(n.path("ref").asText())) return n;
+        }
+        return JSON.missingNode();
+    }
+
+    @Test
+    void kesif_isi_sonucu_Gride_gider() throws Exception {
+        try (TestIed ied = new TestIed()) {
+            jobQueue.add(discoverJob(17, ied.port()));
+            startGateway(TOKEN);
+            waitFor(() -> jobResults.size() == 1, 15000);
+            assertEquals("/api/v1/sa/gateway/jobs/17/result", jobResultPaths.get(0));
+            JsonNode body = jobResults.get(0);
+            assertTrue(body.path("ok").asBoolean(), body.toString());
+            JsonNode r = body.path("result");
+            assertEquals("[\"E1TESTLD0\"]", r.path("logical_devices").toString());
+            assertFalse(r.path("truncated").asBoolean());
+
+            // Yapraklar: yalniz ST / MX; tip bean'in MMS uzerinden okudugu modeldeki tip.
+            JsonNode nodes = r.path("nodes");
+            String[][] want = {
+                {"E1TESTLD0/XCBR1.Pos.stVal", "ST", "DOUBLE_BIT_POS"},
+                {"E1TESTLD0/XCBR1.Pos.q", "ST", "QUALITY"},
+                {"E1TESTLD0/XCBR1.Pos.t", "ST", "TIMESTAMP"},
+                {"E1TESTLD0/MMXU1.A.phsA.cVal.mag.f", "MX", "FLOAT32"},
+                {"E1TESTLD0/MMXU1.A.phsA.q", "MX", "QUALITY"},
+                {"E1TESTLD0/MMXU1.TotW.mag.f", "MX", "FLOAT32"},
+                {"E1TESTLD0/GGIO1.Ind1.stVal", "ST", "BOOLEAN"},
+                {"E1TESTLD0/GGIO1.IntIn1.stVal", "ST", "INT32"},
+                {"E1TESTLD0/MMTR1.TotWh.actVal", "ST", "INT64"},
+                {"E1TESTLD0/XCBR1.Beh.stVal", "ST", "INT8"},
+            };
+            for (String[] w : want) {
+                JsonNode n = find(nodes, w[0]);
+                assertEquals(w[1], n.path("fc").asText(), w[0]);
+                assertEquals(w[2], n.path("type").asText(), w[0]);
+            }
+            for (JsonNode n : nodes) {
+                String fc = n.path("fc").asText();
+                assertTrue("ST".equals(fc) || "MX".equals(fc), n.toString());
+            }
+            assertTrue(find(nodes, "E1TESTLD0/XCBR1.Pos.ctlModel").isMissingNode()); // CF
+
+            JsonNode ds = find(r.path("datasets"), "E1TESTLD0/LLN0.Ds1");
+            assertEquals("[{\"ref\":\"E1TESTLD0/XCBR1.Pos\",\"fc\":\"ST\"},"
+                    + "{\"ref\":\"E1TESTLD0/MMXU1.A.phsA\",\"fc\":\"MX\"},"
+                    + "{\"ref\":\"E1TESTLD0/GGIO1.Ind1\",\"fc\":\"ST\"}]", ds.path("members").toString());
+
+            JsonNode rcbs = r.path("rcbs");
+            assertEquals(3, rcbs.size());
+            JsonNode br = find(rcbs, "E1TESTLD0/LLN0.BR.brcbStat");
+            assertTrue(br.path("buffered").asBoolean());
+            assertEquals("E1TESTLD0/LLN0.Ds1", br.path("dataset").asText());
+            assertFalse(br.path("enabled").asBoolean());
+            for (String u : List.of("E1TESTLD0/LLN0.RP.urcbMeas01", "E1TESTLD0/LLN0.RP.urcbMeas02")) {
+                JsonNode rp = find(rcbs, u);
+                assertFalse(rp.path("buffered").asBoolean(true), u);
+                assertEquals("E1TESTLD0/LLN0.Ds1", rp.path("dataset").asText(), u);
+                assertFalse(rp.path("enabled").asBoolean(true), u);
+            }
+
+            // Saglik sonuc yollandiktan sonra guncellenir.
+            waitFor(() -> gw.healthJson().path("jobs").path("last_id").asLong() == 17, 5000);
+            JsonNode h = gw.healthJson().path("jobs");
+            assertEquals("ok", h.path("last_status").asText());
+            assertFalse(h.path("last_at").isNull());
+            assertEquals("", h.path("poll_error").asText());
+            assertTrue(upgradeHeaders.isEmpty(), "Upgrade basligi gonderildi: " + upgradeHeaders);
+        }
+    }
+
+    @Test
+    void kesif_sonucu_dugum_sinirinda_kesilir() throws Exception {
+        com.beanit.iec61850bean.ServerModel model;
+        try (java.io.InputStream in = TestIed.class.getResourceAsStream("/iec61850/e1test.icd")) {
+            model = com.beanit.iec61850bean.SclParser.parse(in).get(0);
+        }
+        JsonNode full = JobWorker.discoveryResult(model, JobWorker.MAX_NODES);
+        assertFalse(full.path("truncated").asBoolean());
+        assertEquals(36, full.path("nodes").size());
+        JsonNode cut = JobWorker.discoveryResult(model, 5);
+        assertTrue(cut.path("truncated").asBoolean());
+        assertEquals(5, cut.path("nodes").size());
+        assertEquals("[\"E1TESTLD0\"]", cut.path("logical_devices").toString());
+        assertEquals(3, cut.path("rcbs").size()); // kesme yalniz dugumlere uygulanir
+    }
+
+    @Test
+    void kesif_isi_hatasi_ok_false_ile_doner() throws Exception {
+        int closed;
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            closed = s.getLocalPort();
+        }
+        jobQueue.add(discoverJob(21, closed));
+        jobQueue.add("{\"id\":22,\"kind\":\"modbus_scan\",\"params\":{}}");
+        jobQueue.add("{\"id\":23,\"kind\":\"iec61850_discover\",\"params\":{\"port\":102}}");
+        startGateway(TOKEN);
+        waitFor(() -> jobResults.size() == 3, 15000);
+        assertEquals(List.of("/api/v1/sa/gateway/jobs/21/result", "/api/v1/sa/gateway/jobs/22/result",
+                "/api/v1/sa/gateway/jobs/23/result"), jobResultPaths);
+
+        JsonNode refused = jobResults.get(0);
+        assertFalse(refused.path("ok").asBoolean(true));
+        assertTrue(refused.path("result").isMissingNode());
+        String err = refused.path("error").asText();
+        assertTrue(err.startsWith("baglanti kurulamadi: "), err);
+        assertTrue(err.length() <= 300, err);
+
+        assertFalse(jobResults.get(1).path("ok").asBoolean(true));
+        assertEquals("desteklenmeyen is turu: modbus_scan", jobResults.get(1).path("error").asText());
+        assertFalse(jobResults.get(2).path("ok").asBoolean(true));
+        assertTrue(jobResults.get(2).path("error").asText().startsWith("gecersiz parametre: "),
+                jobResults.get(2).toString());
+
+        waitFor(() -> gw.healthJson().path("jobs").path("last_id").asLong() == 23, 5000);
+        JsonNode h = gw.healthJson().path("jobs");
+        assertEquals("error", h.path("last_status").asText());
+    }
+
+    @Test
+    void is_ucu_404_donerse_modul_kapanmaz_yoklama_seyrelir() throws Exception {
+        jobsStatus = 404; // eski Grid: uc yok
+        startGateway(TOKEN);
+        waitFor(() -> values().size() >= 2, 10000);
+        waitFor(() -> jobPolls.get() >= 1, 5000);
+        // Normalde 200 ms'de bir yoklanir; 404'ten sonra 60 sn beklenir.
+        Thread.sleep(2500);
+        assertEquals(1, jobPolls.get());
+        JsonNode h = gw.healthJson();
+        assertTrue(h.path("module_active").asBoolean());
+        assertEquals(1, h.path("ieds").size());
+        assertTrue(h.path("ieds").get(0).path("connected").asBoolean());
+        assertEquals(1, slave.connections.get());
+        assertEquals(0, slave.disconnects.get());
+        assertTrue(h.path("jobs").path("poll_error").asText().startsWith("HTTP 404"), h.toString());
+        assertTrue(h.path("jobs").path("last_id").isNull());
+        assertFalse(h.path("last_config_ok").isNull()); // yapilandirma yoklamasi surer
     }
 
     @Test

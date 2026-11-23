@@ -274,8 +274,8 @@ public final class Iec61850Client implements AutoCloseable {
     }
 
     /**
-     * Tek seferlik model kesfi (CLI): baglanir, modeli ve RCB degerlerini okur,
-     * kapatir. RCB okunamazsa model yine doner.
+     * Tek seferlik model kesfi (CLI ve Grid kesif isi): baglanir, modeli ve RCB
+     * degerlerini okur, kapatir. RCB etkinlestirilmez. RCB okunamazsa model yine doner.
      */
     public static ServerModel discover(Settings settings) throws IOException, ServiceError {
         ClientAssociation a = newSap(settings).associate(InetAddress.getByName(settings.host()), settings.port(),

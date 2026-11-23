@@ -21,6 +21,8 @@ import java.util.UUID;
  * <pre>
  * GET  {base}/sa/gateway/config  -> tum SA IED'leri + noktalari
  * POST {base}/sa/gateway/values  -> deger partisi
+ * GET  {base}/sa/gateway/jobs    -> bekleyen is (kesif; Grid 2.120+)
+ * POST {base}/sa/gateway/jobs/{id}/result -> is sonucu
  * </pre>
  */
 public final class GridClient {
@@ -104,5 +106,27 @@ public final class GridClient {
         JsonNode res = JSON.readTree(r.body());
         JsonNode rej = res.path("rejected");
         return new PostResult(res.path("accepted").asInt(), rej.isArray() ? rej.size() : 0, rej);
+    }
+
+    /** Bekleyen isler: {@code {"jobs": [...]}}. 200 disi -> {@link GridHttpException}. */
+    public JsonNode fetchJobs() throws IOException, InterruptedException {
+        HttpResponse<String> r = http.send(request("/jobs").GET().build(), HttpResponse.BodyHandlers.ofString());
+        if (r.statusCode() != 200) throw new GridHttpException(r.statusCode(), r.body());
+        return JSON.readTree(r.body());
+    }
+
+    /**
+     * Is sonucu. Durum kodunu doner: 200 kabul, 404 is bilinmiyor / suresi doldu,
+     * 409 is zaten bitti (ikisi de tekrar denenmez). Diger kodlar -> {@link GridHttpException}.
+     */
+    public int postJobResult(long jobId, JsonNode result) throws IOException, InterruptedException {
+        HttpRequest req = request("/jobs/" + jobId + "/result")
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(result.toString()))
+                .build();
+        HttpResponse<String> r = http.send(req, HttpResponse.BodyHandlers.ofString());
+        int c = r.statusCode();
+        if (c == 200 || c == 404 || c == 409) return c;
+        throw new GridHttpException(c, r.body());
     }
 }

@@ -138,10 +138,8 @@ public final class Iec61850Reader {
         for (Rcb r : model.getBrcbs()) rcbs.put(r.getReference().toString(), r);
         for (Rcb r : model.getUrcbs()) rcbs.put(r.getReference().toString(), r);
         for (Rcb r : rcbs.values()) {
-            String ref = r.getReference().toString();
-            int dot = ref.lastIndexOf('.');
             boolean buffered = r instanceof Brcb;
-            String grid = ref.substring(0, dot) + (buffered ? ".BR." : ".RP.") + ref.substring(dot + 1);
+            String grid = RcbRef.of(r).gridString();
             String ds = r.getDatSet() == null ? "" : r.getDatSet().getStringValue();
             boolean ena = r.getRptEna() != null && r.getRptEna().getValue();
             if (json) {

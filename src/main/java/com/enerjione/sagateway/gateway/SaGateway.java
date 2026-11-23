@@ -43,6 +43,9 @@ import java.util.logging.Logger;
  * araliginda surer. Kuyruktaki degerler teslim kuralina gore tutulur (atilmaz);
  * modul donunce yeniden kurulan IED'lerin ilk okumasi onlari gunceller. Ag
  * hatasi gibi diger hatalarda mevcut baglantilar calismaya devam eder.
+ *
+ * <p>Is kanali (kesif) ayri is parcacigindadir ({@link JobWorker}); is ucunun
+ * hatasi modul durumunu etkilemez.
  */
 public final class SaGateway implements AutoCloseable {
 
@@ -59,6 +62,7 @@ public final class SaGateway implements AutoCloseable {
     private final LinkedBlockingDeque<ValueItem> queue;
     private final Map<Long, IedHandler> ieds = new LinkedHashMap<>();
     private final Set<String> unsupportedLogged = new HashSet<>();
+    private final JobWorker jobs;
 
     private volatile boolean stopped;
     private volatile String configVersion = "";
@@ -77,6 +81,12 @@ public final class SaGateway implements AutoCloseable {
         this.grid = grid;
         this.opt = opt;
         this.queue = new LinkedBlockingDeque<>();
+        this.jobs = new JobWorker(grid);
+    }
+
+    /** Testler icin: is yoklama araligi ve hata sonrasi bekleme (start'tan once). */
+    void jobIntervals(long pollMs, long backoffMs) {
+        jobs.intervals(pollMs, backoffMs);
     }
 
     public void start() throws IOException {
@@ -86,6 +96,7 @@ public final class SaGateway implements AutoCloseable {
         postThread = new Thread(this::postLoop, "sa-post");
         postThread.setDaemon(true);
         postThread.start();
+        jobs.start();
         if (opt.healthPort() > 0) startHealth();
     }
 
@@ -94,6 +105,7 @@ public final class SaGateway implements AutoCloseable {
         stopped = true;
         if (configThread != null) configThread.interrupt();
         if (postThread != null) postThread.interrupt();
+        jobs.close();
         synchronized (ieds) {
             closeAll(ieds.values());
             ieds.clear();
@@ -379,6 +391,7 @@ public final class SaGateway implements AutoCloseable {
         n.put("sent", sent);
         n.put("dropped", dropped);
         n.put("module_active", !inactive);
+        n.set("jobs", jobs.healthJson());
         ArrayNode arr = n.putArray("ieds");
         synchronized (ieds) {
             for (IedHandler ied : ieds.values()) {
