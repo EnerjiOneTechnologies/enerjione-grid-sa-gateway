@@ -2,8 +2,10 @@ package com.enerjione.sagateway.gateway;
 
 import com.enerjione.sagateway.grid.GridClient;
 import com.enerjione.sagateway.grid.GridClient.ValueItem;
-import com.enerjione.sagateway.iec104.Iec104Client;
 import com.enerjione.sagateway.iec104.Iec104Settings;
+import com.enerjione.sagateway.iec61850.Iec61850Client;
+import com.enerjione.sagateway.iec61850.Iec61850Ied;
+import com.enerjione.sagateway.iec61850.RcbRef;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -34,6 +36,11 @@ import java.util.logging.Logger;
  * <p>Teslim kurali: Grid'e ulasmayan parti KAYBOLMAZ, kuyrugun basina geri
  * konur ve tekrar denenir. Kuyruk sinirlidir; dolarsa en ESKI deger atilir
  * (sayilir ve gunluge yazilir) ki bellek sinirsiz buyumesin.
+ *
+ * <p>Modul kapali (yapilandirma 404) ya da lisans gecersiz (403) ise TUM IED
+ * baglantilari kapatilir, kuyruk bosaltilir ve gateway bosta bekler; yapilandirma
+ * yoklamasi normal araliginda surer. Ag hatasi gibi diger hatalarda mevcut
+ * baglantilar calismaya devam eder.
  */
 public final class SaGateway implements AutoCloseable {
 
@@ -48,11 +55,13 @@ public final class SaGateway implements AutoCloseable {
     private final GridClient grid;
     private final Options opt;
     private final LinkedBlockingDeque<ValueItem> queue;
-    private final Map<Long, Iec104Ied> ieds = new LinkedHashMap<>();
+    private final Map<Long, IedHandler> ieds = new LinkedHashMap<>();
     private final Set<String> unsupportedLogged = new HashSet<>();
 
     private volatile boolean stopped;
     private volatile String configVersion = "";
+    /** Grid modulun kapali / lisansin gecersiz oldugunu soyledi (404 / 403). */
+    private volatile boolean inactive;
     private volatile Instant lastConfigOk;
     private volatile Instant lastPostOk;
     private volatile String lastPostError = "";
@@ -84,7 +93,7 @@ public final class SaGateway implements AutoCloseable {
         if (configThread != null) configThread.interrupt();
         if (postThread != null) postThread.interrupt();
         synchronized (ieds) {
-            ieds.values().forEach(Iec104Ied::close);
+            ieds.values().forEach(IedHandler::close);
             ieds.clear();
         }
         if (health != null) health.stop(0);
@@ -112,15 +121,51 @@ public final class SaGateway implements AutoCloseable {
     private void configLoop() {
         while (!stopped) {
             try {
-                apply(grid.fetchConfig());
+                JsonNode cfg = grid.fetchConfig();
+                if (inactive) {
+                    inactive = false;
+                    LOG.info("sa_module_active (yapilandirma yeniden alindi, IED'ler kuruluyor)");
+                }
+                apply(cfg);
                 lastConfigOk = Instant.now();
             } catch (InterruptedException e) {
                 return;
+            } catch (GridClient.GridHttpException e) {
+                if (e.status == 404 || e.status == 403) {
+                    deactivate(e);
+                } else {
+                    LOG.warning(() -> "sa_config_fetch_failed " + e.getMessage()
+                            + " (mevcut baglantilar calismaya devam eder)");
+                }
             } catch (Exception e) {
                 LOG.warning(() -> "sa_config_fetch_failed " + e.getMessage()
                         + " (mevcut baglantilar calismaya devam eder)");
             }
             sleep(opt.configRefreshSec() * 1000L);
+        }
+    }
+
+    /**
+     * 404 (SA modulu kapali) / 403 (lisans gecersiz): tum IED'ler kapanir, bekleyen
+     * degerler atilir (modul kapaliyken veri akmamali), gateway bosta bekler.
+     * Gunluge yalniz duruma GECISTE yazilir.
+     */
+    private void deactivate(GridClient.GridHttpException e) {
+        int closed;
+        synchronized (ieds) {
+            closed = ieds.size();
+            ieds.values().forEach(IedHandler::close);
+            ieds.clear();
+        }
+        configVersion = "";
+        int cleared = queue.size();
+        queue.clear();
+        if (!inactive) {
+            inactive = true;
+            String why = e.status == 404 ? "SA modulu kapali" : "lisans gecersiz";
+            int c = closed;
+            LOG.warning(() -> "sa_module_inactive http=" + e.status + " (" + why + ") kapatilan_ied=" + c
+                    + " atilan_deger=" + cleared + " (yapilandirma yoklamasi surer)");
         }
     }
 
@@ -130,11 +175,11 @@ public final class SaGateway implements AutoCloseable {
         Map<Long, JsonNode> wanted = new HashMap<>();
         for (JsonNode ied : cfg.path("ieds")) {
             String protocol = ied.path("protocol").asText();
-            if (!"iec104".equals(protocol)) {
+            if (!"iec104".equals(protocol) && !"iec61850".equals(protocol)) {
                 String c = ied.path("code").asText();
                 if (unsupportedLogged.add(c + "/" + protocol)) {
                     LOG.info(() -> "sa_ied_protocol_not_supported ied=" + c + " protokol=" + protocol
-                            + " (bu surumde yalniz iec104)");
+                            + " (bu surumde iec104 ve iec61850)");
                 }
                 continue;
             }
@@ -143,18 +188,19 @@ public final class SaGateway implements AutoCloseable {
         synchronized (ieds) {
             for (Long id : new ArrayList<>(ieds.keySet())) {
                 JsonNode w = wanted.get(id);
-                if (w == null || !fingerprint(w).equals(ieds.get(id).fingerprint)) {
-                    Iec104Ied old = ieds.remove(id);
-                    LOG.info(() -> "sa_ied_stop ied=" + old.code + (w == null ? " (kaldirildi)" : " (degisti)"));
+                if (w == null || !fingerprint(w).equals(ieds.get(id).fingerprint())) {
+                    IedHandler old = ieds.remove(id);
+                    LOG.info(() -> "sa_ied_stop ied=" + old.code() + (w == null ? " (kaldirildi)" : " (degisti)"));
                     old.close();
                 }
             }
             for (Map.Entry<Long, JsonNode> e : wanted.entrySet()) {
                 if (ieds.containsKey(e.getKey())) continue;
                 try {
-                    Iec104Ied ied = build(e.getValue());
+                    IedHandler ied = build(e.getValue());
                     ieds.put(e.getKey(), ied);
-                    LOG.info(() -> "sa_ied_start ied=" + ied.code + " nokta=" + ied.pointCount());
+                    LOG.info(() -> "sa_ied_start ied=" + ied.code() + " protokol=" + ied.protocol()
+                            + " nokta=" + ied.pointCount());
                     ied.start();
                 } catch (RuntimeException ex) {
                     LOG.log(Level.WARNING, "sa_ied_config_invalid ied=" + e.getValue().path("code").asText()
@@ -169,10 +215,15 @@ public final class SaGateway implements AutoCloseable {
     }
 
     private static String fingerprint(JsonNode ied) {
-        return ied.path("connection").toString() + "|" + ied.path("points").toString();
+        return ied.path("protocol").asText() + "|" + ied.path("connection").toString() + "|"
+                + ied.path("points").toString();
     }
 
-    private Iec104Ied build(JsonNode ied) {
+    private IedHandler build(JsonNode ied) {
+        return "iec61850".equals(ied.path("protocol").asText()) ? build61850(ied) : build104(ied);
+    }
+
+    private Iec104Ied build104(JsonNode ied) {
         JsonNode c = ied.path("connection");
         String redundant = c.path("redundant_host").isTextual() ? c.path("redundant_host").asText() : null;
         Iec104Settings s = new Iec104Settings(
@@ -198,6 +249,40 @@ public final class SaGateway implements AutoCloseable {
         }
         return new Iec104Ied(ied.path("id").asLong(), ied.path("code").asText(), fingerprint(ied), s, byIoa,
                 this::enqueue);
+    }
+
+    /**
+     * Grid sozlesmesi: connection = {host, port (102), ap_title, ae_qualifier,
+     * report_control_blocks, gi_on_connect (true), poll_fallback_ms (0)};
+     * nokta adresi = {ref, fc}.
+     */
+    private Iec61850Ied build61850(JsonNode ied) {
+        String code = ied.path("code").asText();
+        JsonNode c = ied.path("connection");
+        List<RcbRef> rcbs = new ArrayList<>();
+        for (JsonNode r : c.path("report_control_blocks")) {
+            try {
+                rcbs.add(RcbRef.parse(r.asText()));
+            } catch (IllegalArgumentException ex) {
+                LOG.warning(() -> "sa_rcb_invalid ied=" + code + " " + ex.getMessage() + " (atlanir)");
+            }
+        }
+        JsonNode ap = c.path("ap_title");
+        JsonNode ae = c.path("ae_qualifier");
+        Iec61850Client.Settings s = Iec61850Client.Settings.of(c.path("host").asText(), c.path("port").asInt(102))
+                .withAcse(ap.isTextual() ? Iec61850Client.Settings.parseApTitle(ap.asText()) : null,
+                        ae.isIntegralNumber() ? Integer.valueOf(ae.asInt()) : null)
+                .withRcbs(rcbs)
+                .withGiOnConnect(c.path("gi_on_connect").asBoolean(true))
+                .withPollMs(c.path("poll_fallback_ms").asInt(0));
+        List<Iec61850Ied.PointRef> points = new ArrayList<>();
+        for (JsonNode p : ied.path("points")) {
+            JsonNode a = p.path("address");
+            if (!a.has("ref")) continue;
+            points.add(new Iec61850Ied.PointRef(p.path("id").asLong(), p.path("code").asText(),
+                    p.path("point_type").asText(), a.path("ref").asText(), a.path("fc").asText()));
+        }
+        return new Iec61850Ied(ied.path("id").asLong(), code, fingerprint(ied), s, points, this::enqueue);
     }
 
     // ---- Grid'e gonderim ------------------------------------------------------
@@ -274,17 +359,23 @@ public final class SaGateway implements AutoCloseable {
         n.put("queue", queue.size());
         n.put("sent", sent);
         n.put("dropped", dropped);
+        n.put("module_active", !inactive);
         ArrayNode arr = n.putArray("ieds");
         synchronized (ieds) {
-            for (Iec104Ied ied : ieds.values()) {
-                Iec104Client.Status st = ied.status();
+            for (IedHandler ied : ieds.values()) {
+                IedHandler.Status st = ied.status();
                 ObjectNode i = arr.addObject();
-                i.put("code", ied.code);
-                i.put("protocol", "iec104");
+                i.put("code", ied.code());
+                i.put("protocol", ied.protocol());
                 i.put("connected", st.connected());
                 i.put("host", st.host());
                 i.put("points", ied.pointCount());
-                i.put("asdu", st.asduCount());
+                if ("iec104".equals(ied.protocol())) {
+                    i.put("asdu", st.messages());
+                } else {
+                    i.put("reports", st.messages());
+                    i.put("rcb_enabled", st.reportsEnabled());
+                }
                 i.put("reconnects", st.reconnects());
                 i.put("last_error", st.lastError());
             }
