@@ -14,7 +14,7 @@ public interface IedHandler extends AutoCloseable {
      * @param reportsEnabled etkin rapor kontrol blogu sayisi (104'te 0)
      */
     record Status(boolean connected, String host, long messages, long reconnects, String lastError,
-                  int reportsEnabled) {
+                  int reportsEnabled, long pollMs) {
     }
 
     /** Grid'deki IED kodu (gunluk ve saglik icin). */

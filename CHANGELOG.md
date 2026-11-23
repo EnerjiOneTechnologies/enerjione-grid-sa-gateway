@@ -10,6 +10,8 @@
   - Hata `ok: false` ve kisa ozetle (en fazla 300 karakter) doner; bilinmeyen tur "desteklenmeyen is turu" ile doner.
   - Is ucunun 404 / 401 / 403 / 5xx / ag hatasi modulu kapatmaz; yalniz is yoklamasi 60 sn'ye seyrelir.
 - `/health`: `jobs` alani (`last_id`, `last_status`, `last_at`, `poll_error`).
+- Tekrar bastirma: `periodic` deger (raporsuz IED yoklamasi, 104 devirli olcum, butunluk raporu) son gonderilenle ayniysa Grid'e gitmez; ayni deger 10 dk'da bir yine gider. Kendiliginden rapor, genel sorgu ve baglanti kaybi her zaman gider; kuyruk tasip deger duserse bellek temizlenir. Raporsuz 1116 sinyallik IED'de Grid'e giden deger saniyede ~220'den yalniz degisenlere indi. `/health` `suppressed`.
+- 61850 yoklama turu korumasi: tur araliktan uzun surerse sonraki tur en az tur suresi kadar bekler (`sa_poll_slow` bir kez); `/health` `poll_ms`.
 
 ### Duzeltildi
 

@@ -193,7 +193,7 @@ public final class Iec61850Client implements AutoCloseable {
 
     /** Anlik durum. */
     public record Status(boolean connected, String host, long reports, long reconnects, String lastError,
-                         int rcbEnabled) {
+                         int rcbEnabled, long pollMs) {
     }
 
     private final String name;
@@ -213,6 +213,8 @@ public final class Iec61850Client implements AutoCloseable {
     private volatile long reconnects;
     private volatile String lastError = "";
     private volatile int rcbEnabled;
+    /** Son yoklama turunun suresi (ms); yoklama yoksa -1. */
+    private volatile long lastPollMs = -1;
     private volatile long rcbRetryMs = RCB_RETRY_MS;
 
     public Iec61850Client(String name, Settings settings, List<Target> targets, Listener listener) {
@@ -266,7 +268,7 @@ public final class Iec61850Client implements AutoCloseable {
     }
 
     public Status status() {
-        return new Status(connected, s.host(), reports.get(), reconnects, lastError, rcbEnabled);
+        return new Status(connected, s.host(), reports.get(), reconnects, lastError, rcbEnabled, lastPollMs);
     }
 
     public Settings settings() {
@@ -522,8 +524,18 @@ public final class Iec61850Client implements AutoCloseable {
                 }
                 now = System.nanoTime();
                 if (polling && now - nextPoll >= 0) {
+                    long t0 = System.nanoTime();
                     readAll("periodic");
-                    nextPoll = System.nanoTime() + pollNs;
+                    long sure = System.nanoTime() - t0;
+                    lastPollMs = sure / 1_000_000;
+                    // Tur araliktan uzun surduyse IED'ye ara vermeden istek gitmesin:
+                    // sonraki tur en az bir tur suresi kadar bekler (IED ve ag korunur).
+                    if (sure > pollNs) {
+                        logOnce("poll_slow", Level.WARNING, "sa_poll_slow ied=" + name + " tur_ms=" + lastPollMs
+                                + " aralik_ms=" + s.pollMs() + " (sonraki tur ertelenir; noktalari azaltin ya da "
+                                + "rapor blogu kullanin)");
+                    }
+                    nextPoll = System.nanoTime() + Math.max(pollNs, sure);
                 } else if (now - (lastActivity + keepNs) >= 0) {
                     probe();
                 }

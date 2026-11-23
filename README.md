@@ -188,6 +188,13 @@ Grid sözleşmesi (`/api/v1/sa/gateway/...`, kimlik `X-SA-Gateway-Token`):
   - IED bağlantısı koparsa noktaları için `value: null, quality: invalid` gönderilir.
 - **Teslim:** Grid'e ulaşamayan parti kaybolmaz; kuyruğun başına konup tekrar denenir. Kuyruk
   dolarsa en eski değer atılır ve sayılır.
+- **Tekrar bastırma:** `periodic` değer (rapor bloğu olmayan IED'nin yoklaması, 104 devirli ölçüm,
+  bütünlük raporu) nokta için son gönderilenle aynıysa (değer ve kalite) gönderilmez; aynı değer
+  10 dk'da bir yine gider. Kendiliğinden rapor, genel sorgu / ilk okuma ve bağlantı kaybı her zaman
+  gider. Kuyruk taşıp değer düşerse bellek temizlenir, sonraki turda her nokta yeniden gider.
+  Raporsuz 1116 sinyallik bir IED'de Grid'e giden değer saniyede ~220'den yalnız değişenlere indi.
+- **Yoklama turu koruması:** 61850 yoklama turu aralıktan uzun sürerse sonraki tur en az tur süresi
+  kadar beklenir (IED'ye ara vermeden istek gitmez); `sa_poll_slow` bir kez günlüğe yazılır.
 
 ### Keşif işleri (Grid 2.120+)
 
@@ -208,10 +215,10 @@ Grid, gateway'e iş verebilir. İlk iş türü IED keşfidir: Grid arayüzü bir
 ### Sağlık
 
 `GET /health` IED başına `protocol`, `connected`, `points`, `reconnects` ve `last_error` verir.
-Bunlara ek olarak 104'te `asdu`, 61850'de `reports` ve `rcb_enabled` (şu an etkin blok sayısı) gelir.
-`last_error` bağlantı kurulunca temizlenir.
+Bunlara ek olarak 104'te `asdu`, 61850'de `reports`, `rcb_enabled` (şu an etkin blok sayısı) ve
+yoklama varsa `poll_ms` (son yoklama turunun süresi) gelir. `last_error` bağlantı kurulunca temizlenir.
 
-Genel alanlarda `module_active` ve `jobs` da bulunur. `jobs`: `last_id`, `last_status` (`ok`, `error`, `rejected`, `post_failed`), `last_at`, `poll_error`.
+Genel alanlarda `module_active`, `suppressed` (gönderilmeyen tekrar sayısı) ve `jobs` da bulunur. `jobs`: `last_id`, `last_status` (`ok`, `error`, `rejected`, `post_failed`), `last_at`, `poll_error`.
 
 ## Geliştirme
 

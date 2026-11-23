@@ -77,7 +77,7 @@ final class Iec104Ied implements IedHandler {
     @Override
     public Status status() {
         Iec104Client.Status st = client.status();
-        return new Status(st.connected(), st.host(), st.asduCount(), st.reconnects(), st.lastError(), 0);
+        return new Status(st.connected(), st.host(), st.asduCount(), st.reconnects(), st.lastError(), 0, -1);
     }
 
     @Override
