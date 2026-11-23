@@ -18,7 +18,7 @@
 ### Degisti
 
 - Protokol isleyicileri ortak bir arayuzde (`IedHandler`) toplandi. Gateway `iec104` ve `iec61850` IED'lerini birlikte calistirir; diger protokoller bir kez gunluge yazilip atlanir.
-- Yapilandirma 404 (SA modulu kapali) ya da 403 (lisans gecersiz) donerse tum IED baglantilari kapatilir ve bekleyen degerler atilir. Gateway bosta bekler, yoklama surer. Gecis bir kez gunluge yazilir (`sa_module_inactive`). Ag hatasi ve 5xx'te mevcut baglantilar eskisi gibi calisir.
+- Yapilandirma 404 (SA modulu kapali) ya da 403 (lisans gecersiz) donerse tum IED baglantilari kapatilir. Gateway bosta bekler, yoklama surer; kuyruktaki degerler atilmaz. Gecis bir kez gunluge yazilir (`sa_module_inactive`). Ag hatasi ve 5xx'te mevcut baglantilar eskisi gibi calisir.
 - `logback-classic` (EPL / LGPL) iec61850bean bagimliligindan haric tutuldu; dagitilan jar'da yok.
 
 ## [0.1.0] - 2026-11-20

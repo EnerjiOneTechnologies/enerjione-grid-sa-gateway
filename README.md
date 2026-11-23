@@ -155,7 +155,7 @@ Grid sözleşmesi (`/api/v1/sa/gateway/...`, kimlik `X-SA-Gateway-Token`):
 
 - `GET config`: tüm SA IED'leri, bağlantı ayarları, noktalar ve adresler. `config_version`
   değişince yalnız değişen IED yeniden kurulur.
-  - **404 / 403:** Modül kapalıysa 404, lisans geçersizse 403 döner. Gateway bu durumda tüm IED bağlantılarını kapatır ve bekleyen değerleri atar. Ardından boşta bekler ve yoklamayı normal aralıkta sürdürür; geçiş günlüğe bir kez yazılır (`sa_module_inactive`).
+  - **404 / 403:** Modül kapalıysa 404, lisans geçersizse 403 döner. Gateway bu durumda tüm IED bağlantılarını kapatır, boşta bekler ve yoklamayı normal aralıkta sürdürür. Geçiş günlüğe bir kez yazılır (`sa_module_inactive`). Kuyruktaki değerler atılmaz; modül dönünce IED'lerin ilk okuması onları günceller.
   - **Diğer hatalar:** Ağ hatası ya da 5xx gibi durumlarda mevcut bağlantılar çalışmaya devam eder.
 - `POST values`: `{"values": [{"point_id", "value", "quality", "ts", "cause"}]}`.
   - `cause`: `spontaneous`, `interrogation`, `periodic`, `return`, `request` ya da `comm_lost`.

@@ -38,9 +38,10 @@ import java.util.logging.Logger;
  * (sayilir ve gunluge yazilir) ki bellek sinirsiz buyumesin.
  *
  * <p>Modul kapali (yapilandirma 404) ya da lisans gecersiz (403) ise TUM IED
- * baglantilari kapatilir, kuyruk bosaltilir ve gateway bosta bekler; yapilandirma
- * yoklamasi normal araliginda surer. Ag hatasi gibi diger hatalarda mevcut
- * baglantilar calismaya devam eder.
+ * baglantilari kapatilir ve gateway bosta bekler; yapilandirma yoklamasi normal
+ * araliginda surer. Kuyruktaki degerler teslim kuralina gore tutulur (atilmaz);
+ * modul donunce yeniden kurulan IED'lerin ilk okumasi onlari gunceller. Ag
+ * hatasi gibi diger hatalarda mevcut baglantilar calismaya devam eder.
  */
 public final class SaGateway implements AutoCloseable {
 
@@ -146,9 +147,8 @@ public final class SaGateway implements AutoCloseable {
     }
 
     /**
-     * 404 (SA modulu kapali) / 403 (lisans gecersiz): tum IED'ler kapanir, bekleyen
-     * degerler atilir (modul kapaliyken veri akmamali), gateway bosta bekler.
-     * Gunluge yalniz duruma GECISTE yazilir.
+     * 404 (SA modulu kapali) / 403 (lisans gecersiz): tum IED'ler kapanir, gateway
+     * bosta bekler. Gunluge yalniz duruma GECISTE yazilir.
      */
     private void deactivate(GridClient.GridHttpException e) {
         int closed;
@@ -158,14 +158,12 @@ public final class SaGateway implements AutoCloseable {
             ieds.clear();
         }
         configVersion = "";
-        int cleared = queue.size();
-        queue.clear();
         if (!inactive) {
             inactive = true;
             String why = e.status == 404 ? "SA modulu kapali" : "lisans gecersiz";
             int c = closed;
             LOG.warning(() -> "sa_module_inactive http=" + e.status + " (" + why + ") kapatilan_ied=" + c
-                    + " atilan_deger=" + cleared + " (yapilandirma yoklamasi surer)");
+                    + " (yapilandirma yoklamasi surer)");
         }
     }
 

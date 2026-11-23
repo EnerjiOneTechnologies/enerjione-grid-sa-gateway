@@ -62,6 +62,30 @@ class Iec61850ReaderTest {
     }
 
     @Test
+    void metin_satiri() {
+        com.beanit.iec61850bean.BdaDoubleBitPos pos = new com.beanit.iec61850bean.BdaDoubleBitPos(
+                new com.beanit.iec61850bean.ObjectReference("LD/XCBR1.Pos.stVal"), com.beanit.iec61850bean.Fc.ST,
+                null, false, false);
+        pos.setDoubleBitPos(com.beanit.iec61850bean.BdaDoubleBitPos.DoubleBitPos.ON);
+        String l = Iec61850Reader.textLine(new com.enerjione.sagateway.iec61850.Iec61850Client.Sample(
+                new com.enerjione.sagateway.iec61850.Iec61850Client.Target("LD/XCBR1.Pos.stVal",
+                        com.beanit.iec61850bean.Fc.ST),
+                pos, true, "GOOD", java.time.Instant.parse("2026-11-21T08:15:30.500Z"), "spontaneous"));
+        assertTrue(l.endsWith("LD/XCBR1.Pos.stVal [ST]  DOUBLE_BIT_POS  spontaneous  deger ON (2)  kalite iyi"
+                + "  zaman 2026-11-21T08:15:30.500Z"), l);
+
+        com.beanit.iec61850bean.BdaFloat32 f = new com.beanit.iec61850bean.BdaFloat32(
+                new com.beanit.iec61850bean.ObjectReference("LD/MMXU1.TotW.mag.f"), com.beanit.iec61850bean.Fc.MX,
+                null, false, false);
+        f.setFloat(12.5f);
+        String m = Iec61850Reader.textLine(new com.enerjione.sagateway.iec61850.Iec61850Client.Sample(
+                new com.enerjione.sagateway.iec61850.Iec61850Client.Target("LD/MMXU1.TotW.mag.f",
+                        com.beanit.iec61850bean.Fc.MX),
+                f, false, "INVALID", null, "periodic"));
+        assertTrue(m.endsWith("FLOAT32  periodic  deger 12.5  kalite GECERSIZ (INVALID)"), m);
+    }
+
+    @Test
     void ref_fc_eslesmesi() {
         assertEquals(2, Iec61850Reader.targets(List.of("A/B.C.d", "A/B.C.e"), List.of("st")).size());
         assertThrows(IllegalArgumentException.class, () -> Iec61850Reader.targets(List.of("A/B.C.d"), List.of()));

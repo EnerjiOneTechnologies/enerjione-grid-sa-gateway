@@ -252,7 +252,6 @@ class GatewayTest {
         waitFor(() -> slave.disconnects.get() == 1, 5000);
         Thread.sleep(2500); // yapilandirma yoklamasi surer ama yeniden baglanilmaz
         assertEquals(1, slave.connections.get());
-        assertEquals(0, gw.queueSize());
 
         // Modul geri acilinca IED yeniden kurulur.
         configStatus = 200;

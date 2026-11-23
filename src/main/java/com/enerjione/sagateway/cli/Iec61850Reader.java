@@ -1,5 +1,7 @@
 package com.enerjione.sagateway.cli;
 
+import com.beanit.iec61850bean.BdaBoolean;
+import com.beanit.iec61850bean.BdaDoubleBitPos;
 import com.beanit.iec61850bean.Brcb;
 import com.beanit.iec61850bean.DataSet;
 import com.beanit.iec61850bean.Fc;
@@ -220,7 +222,10 @@ public final class Iec61850Reader {
                 .append("  ").append(x.leaf().getBasicType())
                 .append("  ").append(x.cause())
                 .append("  deger ").append(x.leaf().getValueString());
-        if (num != null && !x.leaf().getValueString().equals(format(num))) sb.append(" (").append(format(num)).append(')');
+        // Sayisal karsilik yalniz metin degerli tiplerde (ON/OFF, true/false) eklenir.
+        if (num != null && (x.leaf() instanceof BdaDoubleBitPos || x.leaf() instanceof BdaBoolean)) {
+            sb.append(" (").append(format(num)).append(')');
+        }
         sb.append("  kalite ").append(x.good() ? "iyi" : "GECERSIZ (" + x.validity() + ")");
         if (x.time() != null) sb.append("  zaman ").append(x.time());
         return sb.toString();

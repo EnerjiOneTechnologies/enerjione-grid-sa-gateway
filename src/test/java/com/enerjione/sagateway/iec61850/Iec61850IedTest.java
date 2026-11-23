@@ -137,8 +137,11 @@ class Iec61850IedTest {
         waitInitial2();
         // urcbMeas yok, urcbMeas01 kullanildi (numarali ornek).
         waitFor(() -> handler.status().reportsEnabled() == 1, 5000);
-        // GI raporu geldi (degisim olmadan).
+        // GI raporu geldi (degisim olmadan); sebebi GI oldugu icin "interrogation".
+        // Yoklama kapali: ikinci interrogation degeri yalniz GI raporundan gelebilir.
         waitFor(() -> handler.status().messages() >= 1, 5000);
+        waitFor(() -> of(POS.id(), "interrogation").size() >= 2 && of(IA.id(), "interrogation").size() >= 2, 5000);
+        assertTrue(of(POS.id(), "spontaneous").isEmpty());
 
         Instant t1 = Instant.parse("2026-11-21T08:15:30.500Z");
         ied.setPos(DoubleBitPos.OFF, Validity.GOOD, t1);
