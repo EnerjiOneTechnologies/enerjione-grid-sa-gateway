@@ -117,7 +117,13 @@ AA1E01A1LD0/LLN0.BR.brcbStat01  veri_kumesi=AA1E01A1LD0/LLN0$StatDs
   - **Örnek adı:** Ad modelde birebir yoksa aynı LN'deki numaralı örnekler sırayla denenir (`ad01`, `ad02`...). Birebir ad varken başka örneğe geçilmez; o örnek başka bir istemciye ayrılmış olabilir.
   - **Etkinleştirme sırası:** Bloğun değerleri okunur. Başka istemcide etkinse ya da veri kümesi modelde yoksa sonraki örneğe geçilir. URCB rezerve edilir. Tetikleyicilere veri değişimi, kalite değişimi ve GI eklenir. İsteğe bağlı alanlara sıra no, rapor zamanı, veri kümesi adı ve dahil olma sebebi eklenir. Ardından blok etkinleştirilir ve `gi_on_connect` ise GI yapılır.
   - **Ayar reddi:** IED ayar yazmayı reddederse bloktaki ayarla devam edilir.
-  - **Etkinleşmeyen blok:** günlüğe yazılır, diğerleriyle devam edilir.
+  - **Etkinleşmeyen blok:** günlüğe bir kez yazılır, diğerleriyle devam edilir.
+    - **Meşgul blok:** Blok başka istemcide olduğu için etkinleşmediyse (RptEna açık, rezervasyon ya da etkinleştirme reddi) 30 sn'de bir yeniden denenir.
+    - **Geç etkinleşme:** `gi_on_connect` ise o blokta GI yapılır, değilse tüm noktalar okunur. Arada kaçan değişim olmaz.
+    - **Yapısal hata:** Blok yoksa ya da veri kümesi boşsa veya modelde yoksa yeniden denenmez.
+  - **Bırakma:** IED değişince, silinince ya da gateway dururken bağlantı tuttuğu blokları bırakır (RptEna=false, URCB rezervasyonu iptal), sonra kapanır. Yeni bağlantı aynı BRCB'yi ve aynı URCB örneğini alır.
+    - Süre sınırlıdır: istek başına 1 sn, toplam 3 sn. Hat yanıt vermezse bırakmadan kapanır.
+    - Beklenmedik kopmada bırakma yapılamaz; blokları IED'nin kendisi bırakmalıdır.
   - **Rapor sebebi:** GI raporu `interrogation`, bütünlük (integrity) raporu `periodic`, diğerleri `spontaneous` olarak gider.
 - **Yoklama yedeği:** `poll_fallback_ms > 0` ise tüm noktalar bu aralıkla okunur (`periodic`). Hiçbir blok etkinleşmese de yoklama çalışır. Rapor bloğu da yoklama da yoksa değerler yalnız bağlanınca okunur; günlüğe uyarı düşer.
 - **Değer çevirme:**
@@ -183,9 +189,29 @@ Grid sözleşmesi (`/api/v1/sa/gateway/...`, kimlik `X-SA-Gateway-Token`):
 - **Teslim:** Grid'e ulaşamayan parti kaybolmaz; kuyruğun başına konup tekrar denenir. Kuyruk
   dolarsa en eski değer atılır ve sayılır.
 
+### Keşif işleri (Grid 2.120+)
+
+Grid, gateway'e iş verebilir. İlk iş türü IED keşfidir: Grid arayüzü bir IP'deki 61850 IED'sinin modelini sahaya gitmeden okur.
+
+- `GET jobs`: Ayrı bir iş parçacığı 3 sn'de bir yoklar. Aynı anda tek iş çalışır. Keşif, yapılandırma yoklamasını ve değer gönderimini bekletmez.
+- **`iec61850_discover`:** `params` = `{host, port, ap_title, ae_qualifier, timeout_ms}`; null değer varsayılan demektir.
+  - Okuyucunun keşfiyle aynıdır: IED'ye bağlanır, modeli ve RCB değerlerini okur, kapatır.
+  - Keşif bir izleme bağlantısı değildir; RCB etkinleştirilmez.
+- `POST jobs/{id}/result`: `{"ok": true, "result": {logical_devices, nodes, datasets, rcbs, truncated}}` ya da `{"ok": false, "error": "..."}`.
+  - `nodes`: FC'si ST ya da MX olan yapraklar (`ref`, `fc`, `type`). En fazla 50 000 düğüm gider; aşılırsa `truncated: true`.
+  - `type` iec61850bean tip adıdır. Test sunucusunda görülenler: Dbpos `DOUBLE_BIT_POS`, BOOLEAN `BOOLEAN`, FLOAT32 `FLOAT32`, INT32 `INT32`, INT64 `INT64`, Enum `INT8`, Quality `QUALITY`, Timestamp `TIMESTAMP`.
+  - `datasets` noktalı biçimdedir. `rcbs` Grid biçimindedir (`LD/LN.BR.ad`, `LD/LN.RP.ad`); `dataset` ve `enabled` (şu anki RptEna) ile gelir.
+  - `error` en fazla 300 karakterlik kısa bir özettir, ör. `baglanti kurulamadi: ConnectException: Connection refused`. Bilinmeyen iş türü `desteklenmeyen is turu` ile döner.
+  - Sonuç 5xx ya da ağ hatasında iki kez daha denenir. 404 (iş bilinmiyor) ve 409 (iş bitti) tekrar denenmez.
+- **İş ucu hatası:** 404 (eski Grid ya da modül kapalı), 401/403, 5xx ya da ağ hatası modülü kapatmaz. Yalnız iş yoklaması 60 sn'ye seyrelir; IED bağlantıları sürer.
+
+### Sağlık
+
 `GET /health` IED başına `protocol`, `connected`, `points`, `reconnects` ve `last_error` verir.
-Bunlara ek olarak 104'te `asdu`, 61850'de `reports` ve `rcb_enabled` gelir. Genel alanlarda
-`module_active` da bulunur.
+Bunlara ek olarak 104'te `asdu`, 61850'de `reports` ve `rcb_enabled` (şu an etkin blok sayısı) gelir.
+`last_error` bağlantı kurulunca temizlenir.
+
+Genel alanlarda `module_active` ve `jobs` da bulunur. `jobs`: `last_id`, `last_status` (`ok`, `error`, `rejected`, `post_failed`), `last_at`, `poll_error`.
 
 ## Geliştirme
 
@@ -201,6 +227,7 @@ Testler (`mvn verify`):
 - **Test istasyonuyla gerçek TCP üzerinden:** STARTDT, genel sorgu, w/t2 onayı, t3 TESTFR, t1 zaman aşımı, sıra hatası, hat kopması, yeniden başlayan istasyon, yedek adres, periyodik genel sorgu.
 - **Uçtan uca:** test istasyonu → gateway → sahte Grid. Kapsananlar: Grid geçici hata verdiğinde değer kaybolmaması, yanlış belirteç, yapılandırma değişimi, kuyruk sınırı.
 - **Modül kapalı:** sahte Grid 404 ya da 403 döndüğünde tüm IED'ler kapanır, 200'de geri gelir. 500'de bağlantılar korunur.
+- **İş kanalı:** keşif sonucu (tipler, veri kümesi, bloklar), kapalı port / bilinmeyen tür / eksik host hatası, düğüm sınırı. İş ucu 404 döndüğünde modül kapanmaz, yoklama seyrelir.
 - **61850, süreç içi iec61850bean sunucusuyla:** Sunucu küçük bir SCL test dosyasından (`src/test/resources/iec61850/e1test.icd`) kurulur. Kapsananlar:
   - ilk okumada tüm tipler
   - rapordan gelen değişim (`spontaneous`, zaman ve kalite ile)
@@ -210,6 +237,8 @@ Testler (`mvn verify`):
   - sunucu durunca `comm_lost` ve yeniden bağlanma
   - numaralı URCB örneği; ikinci istemcinin sonraki örneği alması
   - BRCB ile URCB'nin birlikte etkinleşmesi
+  - kapatınca, değişen ya da silinen IED'de blokların bırakılması; aynı sunucudaki yeni IED'nin aynı örnekleri alması
+  - başka istemcideki bloğun bırakılınca yeniden denemede etkinleşmesi (okuma ve GI ile)
   - yarı açık hattın canlılık okumasıyla fark edilmesi
   - okuyucu (keşif ve izleme)
   - gateway üzerinden uçtan uca
@@ -225,7 +254,9 @@ henüz denenmedi. Bilinen sınırlar:
 - **Rapor sırası:** iec61850bean her raporu ayrı bir iş parçacığında verir. Arka arkaya çok hızlı gelen iki raporun sırası nadiren karışabilir; değer zaman etiketiyle (`ts`) gider.
 - **Okuma ile rapor çakışması:** Okuma yanıtı yolda iken gelen daha yeni bir rapor, yerel modelde eski okuma değeriyle ezilebilir. Bir sonraki değişim, okuma ya da GI bunu düzeltir.
 - **Model okuma:** iec61850bean model okumada veri kümesi listesinin devamını (more follows) desteklemez; çok sayıda veri kümesi olan bir LD'de bağlantı kurulamayabilir.
-- **Eski bağlantı:** Önceki bağlantıdan kalan rezerve / etkin blok IED bırakana kadar "başka istemcide" görünür.
+- **Eski bağlantı:** Beklenmedik kopmada (gateway çöktü, hat koptu) önceki bağlantının blokları IED bırakana kadar "başka istemcide" görünür; gateway onları 30 sn'de bir yeniden dener.
+  - iec61850bean sunucusu kapanan bağlantının bloklarını hiç bırakmaz: BRCB'nin ve URCB'nin RptEna'sı açık kalır.
+  - Bu sunucuda blokları yalnız bilerek durdurmadaki bırakma boşaltır.
 
 ## Lisans
 
