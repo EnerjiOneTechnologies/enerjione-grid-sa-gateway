@@ -75,6 +75,8 @@ public final class Iec61850Client implements AutoCloseable {
     private static final long RELEASE_BUDGET_MS = 3000;
     /** close(): oturumun RCB'leri birakmasi icin beklenen en uzun sure. */
     private static final long CLOSE_JOIN_MS = 5000;
+    /** Bu kadar oturum ust uste LN okumasinda zaman asimiyla biterse IED'de LN okumasi kapanir. */
+    private static final int LN_ZAMAN_ASIMI_SINIRI = 2;
 
     /**
      * Baglanti ayarlari. Alanlar Grid SA'daki IEC 61850 IED baglantisiyla ayni
@@ -218,6 +220,12 @@ public final class Iec61850Client implements AutoCloseable {
     /** Son yoklama turunun suresi (ms); yoklama yoksa -1. */
     private volatile long lastPollMs = -1;
     private volatile long rcbRetryMs = RCB_RETRY_MS;
+    /** LN okumasini reddeden LN + FC'ler ("LN|FC"); oturumlar arasi korunur. */
+    private final Set<String> lnRed = ConcurrentHashMap.newKeySet();
+    /** Ust uste kac oturum, hic LN okumasi basaramadan LN okumasinda zaman asimiyla bitti. */
+    private volatile int lnZamanAsimi;
+    /** LN okumasina yanit vermeyen IED: bu istemci boyunca DO basina okunur. */
+    private volatile boolean lnKapali;
 
     public Iec61850Client(String name, Settings settings, List<Target> targets, Listener listener) {
         this.name = name;
@@ -503,6 +511,8 @@ public final class Iec61850Client implements AutoCloseable {
         private final Map<String, BasicDataAttribute> index = new HashMap<>();
         private final List<Group> groups = new ArrayList<>();
         private final List<LnGroup> lnGroups = new ArrayList<>();
+        /** Bu oturumda en az bir LN okumasi basarili oldu (hat LN okumasini tasiyor). */
+        private boolean lnBasarili;
         // yalniz oturum is parcaciginda
         private final List<Rcb> enabled = new ArrayList<>();
         /** IED'de tutabilecegimiz bloklar (rezerve URCB, etkin ya da etkinlestirilmekte olan): kapanista birakilir. */
@@ -695,7 +705,9 @@ public final class Iec61850Client implements AutoCloseable {
                         for (ModelNode d : ln.getChildren()) {
                             if (d instanceof FcModelNode f && !(f instanceof Rcb) && f.getFc() == fc) dos.add(f);
                         }
-                        return new LnGroup(ln.getReference().toString(), fc, dos);
+                        LnGroup yeni = new LnGroup(ln.getReference().toString(), fc, dos);
+                        yeni.doBasina = lnRed.contains(yeni.lnRef + "|" + fc);
+                        return yeni;
                     });
                     l.groups.add(g);
                 }
@@ -982,7 +994,7 @@ public final class Iec61850Client implements AutoCloseable {
             for (LnGroup l : lnGroups) {
                 if (stopped) return;
                 // Tek izlenen DO'lu LN'de LN okumasi istek kazandirmaz (fazla veri tasir).
-                if (l.doBasina || l.groups.size() < 2) {
+                if (lnKapali || l.doBasina || l.groups.size() < 2) {
                     for (Group g : l.groups) {
                         if (stopped) return;
                         readGroup(g, cause);
@@ -993,15 +1005,30 @@ public final class Iec61850Client implements AutoCloseable {
             }
         }
 
-        /** LN + FC tek istek; reddedilirse bu LN oturum boyunca DO basina okunur. */
+        /**
+         * LN + FC tek istek. Reddedilirse bu LN (yeniden baglanmalarda da) DO basina
+         * okunur. Zaman asiminda iliski her durumda yeniden kurulur (call); oturumda hic
+         * LN okumasi basarmadiysa sayilir, ust uste LN_ZAMAN_ASIMI_SINIRI oturum boyle
+         * biterse bu IED'de LN okumasi kapanir. Basarili LN okumasindan sonraki hat
+         * kopmasi sayilmaz.
+         */
         private void readLn(LnGroup l, String cause) throws IOException {
             List<FcModelNode> kopyalar = new ArrayList<>(l.dos.size());
             for (FcModelNode d : l.dos) kopyalar.add((FcModelNode) d.copy());
             FcDataObject istek = new FcDataObject(new ObjectReference(l.lnRef), l.fc, kopyalar);
             try {
                 call(() -> assoc.getDataValues(istek));
+            } catch (IOException e) {
+                if (!lnBasarili && e.getCause() instanceof ServiceError se && se.getErrorCode() == ServiceError.TIMEOUT
+                        && ++lnZamanAsimi >= LN_ZAMAN_ASIMI_SINIRI && !lnKapali) {
+                    lnKapali = true;
+                    LOG.warning(() -> "sa_iec61850_ln_read_off ied=" + name + " (LN okumasi " + lnZamanAsimi
+                            + " oturumdur yanitsiz; DO basina okunur)");
+                }
+                throw e;
             } catch (ServiceError | RuntimeException e) {
                 l.doBasina = true;
+                lnRed.add(l.lnRef + "|" + l.fc);
                 logOnce("ln|" + l.lnRef + l.fc, Level.FINE, "sa_iec61850_ln_read_failed ied=" + name + " ln="
                         + l.lnRef + " fc=" + l.fc + " " + (e instanceof ServiceError se ? describe(se) : e.toString())
                         + " (DO basina okunur)");
@@ -1011,6 +1038,8 @@ public final class Iec61850Client implements AutoCloseable {
                 }
                 return;
             }
+            lnBasarili = true;
+            lnZamanAsimi = 0;
             synchronized (lock) {
                 for (int i = 0; i < l.dos.size(); i++) apply(l.dos.get(i), kopyalar.get(i));
                 for (Group g : l.groups) {
