@@ -2,6 +2,11 @@
 
 ## [Yayinlanmamis]
 
+### Degisti
+
+- 61850 yoklamasi LN duzeyinde: ayni LN'deki ayni FC'li DO'lar tek MMS istegiyle (`LN$FC`) okunur. 1116 sinyallik simulatorde tur ~9 sn'den ~0,7 sn'ye indi (202 istek, onceden ~1000). LN okumasini reddeden IED'de o LN kalici olarak DO basina okumaya duser (`sa_iec61850_ln_read_failed` bir kez, FINE).
+- Yoklama araligi turun basindan sayilir: bir deger en gec bir aralik sonra yeniden okunur (onceden aralik + tur). Tur araliktan uzunsa koruma aynen: sonraki tur en az tur suresi kadar bekler.
+
 ## [0.3.0] - 2026-11-23
 
 ### Eklendi

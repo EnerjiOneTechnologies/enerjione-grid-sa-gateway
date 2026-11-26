@@ -11,9 +11,11 @@ import com.beanit.iec61850bean.ClientAssociation;
 import com.beanit.iec61850bean.ClientEventListener;
 import com.beanit.iec61850bean.ClientSap;
 import com.beanit.iec61850bean.Fc;
+import com.beanit.iec61850bean.FcDataObject;
 import com.beanit.iec61850bean.FcModelNode;
 import com.beanit.iec61850bean.LogicalNode;
 import com.beanit.iec61850bean.ModelNode;
+import com.beanit.iec61850bean.ObjectReference;
 import com.beanit.iec61850bean.Rcb;
 import com.beanit.iec61850bean.Report;
 import com.beanit.iec61850bean.ServerModel;
@@ -436,6 +438,30 @@ public final class Iec61850Client implements AutoCloseable {
         }
     }
 
+    /**
+     * Ayni mantiksal dugum + FC'deki DO gruplari TEK istekle okunur (MMS "LN$FC").
+     * Olcum (kullanici simulatoru, 1116 sinyal / 1078 DO, 2026-11-26): DO basina tur
+     * ~9 sn, LN duzeyinde 202 istekle ~0,7 sn; degerler ayni. Yanit yapisi sunucunun
+     * LN'sindeki o FC'li TUM DO'lardir: istek de hepsini model sirasiyla tasir.
+     * Sunucu reddederse bu LN oturum boyunca DO basina okunur (eski yol).
+     */
+    private static final class LnGroup {
+        final String lnRef;
+        final Fc fc;
+        /** LN'deki bu FC'li tum DO'lar (yerel model, model sirasi). */
+        final List<FcModelNode> dos;
+        /** Izlenen DO gruplari (bu LN + FC). */
+        final List<Group> groups = new ArrayList<>();
+        /** LN okumasi reddedildi: oturum boyunca DO basina. */
+        boolean doBasina;
+
+        LnGroup(String lnRef, Fc fc, List<FcModelNode> dos) {
+            this.lnRef = lnRef;
+            this.fc = fc;
+            this.dos = dos;
+        }
+    }
+
     @FunctionalInterface
     private interface Request {
         void run() throws IOException, ServiceError;
@@ -476,6 +502,7 @@ public final class Iec61850Client implements AutoCloseable {
         private final Map<String, List<Watched>> byQuality = new HashMap<>();
         private final Map<String, BasicDataAttribute> index = new HashMap<>();
         private final List<Group> groups = new ArrayList<>();
+        private final List<LnGroup> lnGroups = new ArrayList<>();
         // yalniz oturum is parcaciginda
         private final List<Rcb> enabled = new ArrayList<>();
         /** IED'de tutabilecegimiz bloklar (rezerve URCB, etkin ya da etkinlestirilmekte olan): kapanista birakilir. */
@@ -528,14 +555,18 @@ public final class Iec61850Client implements AutoCloseable {
                     readAll("periodic");
                     long sure = System.nanoTime() - t0;
                     lastPollMs = sure / 1_000_000;
+                    // Aralik turun BASINDAN sayilir: bir deger en gec bir aralik sonra
+                    // yeniden okunur (tur bitince bekleseydik gecikme aralik + tur olurdu).
                     // Tur araliktan uzun surduyse IED'ye ara vermeden istek gitmesin:
                     // sonraki tur en az bir tur suresi kadar bekler (IED ve ag korunur).
                     if (sure > pollNs) {
                         logOnce("poll_slow", Level.WARNING, "sa_poll_slow ied=" + name + " tur_ms=" + lastPollMs
                                 + " aralik_ms=" + s.pollMs() + " (sonraki tur ertelenir; noktalari azaltin ya da "
                                 + "rapor blogu kullanin)");
+                        nextPoll = System.nanoTime() + sure;
+                    } else {
+                        nextPoll = t0 + pollNs;
                     }
-                    nextPoll = System.nanoTime() + Math.max(pollNs, sure);
                 } else if (now - (lastActivity + keepNs) >= 0) {
                     probe();
                 }
@@ -654,6 +685,21 @@ public final class Iec61850Client implements AutoCloseable {
                     byGroup.computeIfAbsent(g.getReference() + "|" + g.getFc(), k -> new Group(g)).members.add(w);
                 }
                 groups.addAll(byGroup.values());
+                // LN + FC kumeleri (yoklama turu bunlarla okunur; bkz. LnGroup).
+                Map<String, LnGroup> byLn = new LinkedHashMap<>();
+                for (Group g : groups) {
+                    ModelNode ln = g.node.getParent();
+                    Fc fc = g.node.getFc();
+                    LnGroup l = byLn.computeIfAbsent(ln.getReference() + "|" + fc, k -> {
+                        List<FcModelNode> dos = new ArrayList<>();
+                        for (ModelNode d : ln.getChildren()) {
+                            if (d instanceof FcModelNode f && !(f instanceof Rcb) && f.getFc() == fc) dos.add(f);
+                        }
+                        return new LnGroup(ln.getReference().toString(), fc, dos);
+                    });
+                    l.groups.add(g);
+                }
+                lnGroups.addAll(byLn.values());
             }
         }
 
@@ -933,9 +979,46 @@ public final class Iec61850Client implements AutoCloseable {
         // ---- okuma -----------------------------------------------------------
 
         private void readAll(String cause) throws IOException {
-            for (Group g : groups) {
+            for (LnGroup l : lnGroups) {
                 if (stopped) return;
-                readGroup(g, cause);
+                // Tek izlenen DO'lu LN'de LN okumasi istek kazandirmaz (fazla veri tasir).
+                if (l.doBasina || l.groups.size() < 2) {
+                    for (Group g : l.groups) {
+                        if (stopped) return;
+                        readGroup(g, cause);
+                    }
+                } else {
+                    readLn(l, cause);
+                }
+            }
+        }
+
+        /** LN + FC tek istek; reddedilirse bu LN oturum boyunca DO basina okunur. */
+        private void readLn(LnGroup l, String cause) throws IOException {
+            List<FcModelNode> kopyalar = new ArrayList<>(l.dos.size());
+            for (FcModelNode d : l.dos) kopyalar.add((FcModelNode) d.copy());
+            FcDataObject istek = new FcDataObject(new ObjectReference(l.lnRef), l.fc, kopyalar);
+            try {
+                call(() -> assoc.getDataValues(istek));
+            } catch (ServiceError | RuntimeException e) {
+                l.doBasina = true;
+                logOnce("ln|" + l.lnRef + l.fc, Level.FINE, "sa_iec61850_ln_read_failed ied=" + name + " ln="
+                        + l.lnRef + " fc=" + l.fc + " " + (e instanceof ServiceError se ? describe(se) : e.toString())
+                        + " (DO basina okunur)");
+                for (Group g : l.groups) {
+                    if (stopped) return;
+                    readGroup(g, cause);
+                }
+                return;
+            }
+            synchronized (lock) {
+                for (int i = 0; i < l.dos.size(); i++) apply(l.dos.get(i), kopyalar.get(i));
+                for (Group g : l.groups) {
+                    for (Watched w : g.members) {
+                        loggedOnce.remove("rf|" + w.target.key());
+                        emit(w, cause);
+                    }
+                }
             }
         }
 
