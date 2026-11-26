@@ -2,6 +2,11 @@
 
 ## [Yayinlanmamis]
 
+### Duzeltildi
+
+- 61850 BRCB tekrari: yeniden baglanmada IED tamponu bastan yolluyordu (EntryID yazilmiyordu); gecmise yinelenen ve eski tarihli olaylar dusuyor, canli deger kisa sure eski degerlere donuyordu. Artik her BRCB icin son alinan EntryID tutulur (IED ayari degisse de surec boyunca) ve etkinlestirmeden once yazilir: IED yalniz kopukken kacan girdileri yollar (`sa_brcb_resumed`; IED reddederse `sa_brcb_resume_rejected`, tampon bastan gelir). BRCB'de OptFlds entryID acilir. Surdurulen BRCB'de GI istenmez (libiec61850'de tampon gonderimini kesip girdi atlatiyordu); guncel deger baglanirken okumayla gelir.
+- Daha once tutulan BRCB ornegi mesgulse (IED onceki baglantiyi henuz dusurmedi) 60 sn baska ornege gecilmez (`sa_brcb_wait`): tampon o ornekte. Onceden hemen bos ornege (brc102) gecilip kopukken kacan olaylar kayboluyordu. Gateway sureci yeniden baslarsa tampon bastan gelir; Grid ayni zaman etiketli ayni degeri tekrar sayar (Grid tarafi).
+
 ### Degisti
 
 - 61850 yoklamasi LN duzeyinde: ayni LN'deki ayni FC'li DO'lar tek MMS istegiyle (`LN$FC`) okunur. 1116 sinyallik simulatorde tur ~9 sn'den ~0,7 sn'ye indi (202 istek, onceden ~1000). LN okumasini reddeden IED'de o LN, yeniden baglanmalarda da DO basina okunur (`sa_iec61850_ln_read_failed` bir kez, FINE). LN okumasina hic yanit vermeyen IED'de (ust uste 2 oturum, oturumda basarili LN okumasi yokken zaman asimi) LN okumasi kapanir, DO basina okunur (`sa_iec61850_ln_read_off`); basarili LN okumasindan sonraki hat kopmasi sayilmaz.
