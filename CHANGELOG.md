@@ -2,6 +2,8 @@
 
 ## [Yayinlanmamis]
 
+## [0.4.0] - 2026-11-26
+
 ### Duzeltildi
 
 - 61850 BRCB tekrari: yeniden baglanmada IED tamponu bastan yolluyordu (EntryID yazilmiyordu); gecmise yinelenen ve eski tarihli olaylar dusuyor, canli deger kisa sure eski degerlere donuyordu. Artik her BRCB icin son alinan EntryID tutulur (IED ayari degisse de surec boyunca) ve etkinlestirmeden once yazilir: IED yalniz kopukken kacan girdileri yollar (`sa_brcb_resumed`; IED reddederse `sa_brcb_resume_rejected`, tampon bastan gelir). BRCB'de OptFlds entryID acilir. Surdurulen BRCB'de GI istenmez (gozlem: GI'li denemede libiec61850 bir tampon girdisini atladi, GI'siz turlarda atlamadi); guncel deger baglanirken okumayla gelir.
