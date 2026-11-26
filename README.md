@@ -125,7 +125,7 @@ AA1E01A1LD0/LLN0.BR.brcbStat01  veri_kumesi=AA1E01A1LD0/LLN0$StatDs
     - Süre sınırlıdır: istek başına 1 sn, toplam 3 sn. Hat yanıt vermezse bırakmadan kapanır.
     - Beklenmedik kopmada bırakma yapılamaz; blokları IED'nin kendisi bırakmalıdır.
   - **Rapor sebebi:** GI raporu `interrogation`, bütünlük (integrity) raporu `periodic`, diğerleri `spontaneous` olarak gider.
-- **Yoklama yedeği:** `poll_fallback_ms > 0` ise tüm noktalar bu aralıkla okunur (`periodic`). Hiçbir blok etkinleşmese de yoklama çalışır. Rapor bloğu da yoklama da yoksa değerler yalnız bağlanınca okunur; günlüğe uyarı düşer.
+- **Yoklama yedeği:** `poll_fallback_ms > 0` ise tüm noktalar bu aralıkla okunur (`periodic`). Aralık turun başından sayılır. Aynı LN'deki aynı FC'li DO'lar tek istekle (`LN$FC`) okunur; IED bunu reddederse o LN DO başına okunur. Hiçbir blok etkinleşmese de yoklama çalışır. Rapor bloğu da yoklama da yoksa değerler yalnız bağlanınca okunur; günlüğe uyarı düşer.
 - **Değer çevirme:**
 
 | Nokta | 61850 tipi | Değer |

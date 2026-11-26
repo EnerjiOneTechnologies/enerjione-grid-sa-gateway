@@ -199,6 +199,26 @@ class Iec61850IedTest {
         assertTrue(of(IA.id(), "spontaneous").isEmpty()); // rapor yolu yok
     }
 
+    @Test
+    void ayni_LN_deki_noktalar_tek_turda_dogru_okunur() throws Exception {
+        // XCBR1: Pos + Beh (ST), MMXU1: A + TotW (MX) -> LN + FC duzeyinde tek istek.
+        // Sunucu LN okumasini reddederse DO basina okumaya duser; degerler iki
+        // yolda da dogru gelmeli.
+        start(base().withPollMs(300), List.of(POS, BEH, IA, TOTW));
+        waitFor(() -> !of(POS.id(), "interrogation").isEmpty() && !of(BEH.id(), "interrogation").isEmpty()
+                && !of(IA.id(), "interrogation").isEmpty() && !of(TOTW.id(), "interrogation").isEmpty(), 15_000);
+
+        ied.setPos(DoubleBitPos.ON, Validity.GOOD, Instant.parse("2026-11-26T10:00:00Z"));
+        ied.setPhsA(33.0f, Validity.GOOD, Instant.parse("2026-11-26T10:00:01Z"));
+        waitFor(() -> last(POS.id(), v -> "periodic".equals(v.cause()) && Double.valueOf(2.0).equals(v.value()))
+                .isPresent(), 5000);
+        waitFor(() -> last(IA.id(), v -> "periodic".equals(v.cause()) && Double.valueOf(33.0).equals(v.value()))
+                .isPresent(), 5000);
+        // Ayni turdaki komsu DO'lar da okunur (gecerli kalite, deger var).
+        assertTrue(last(BEH.id(), v -> "periodic".equals(v.cause()) && v.value() != null).isPresent());
+        assertTrue(last(TOTW.id(), v -> "periodic".equals(v.cause()) && v.value() != null).isPresent());
+    }
+
     private void waitInitial2NoInd() throws InterruptedException {
         waitFor(() -> !of(POS.id(), "interrogation").isEmpty() && !of(IA.id(), "interrogation").isEmpty(), 15_000);
     }
