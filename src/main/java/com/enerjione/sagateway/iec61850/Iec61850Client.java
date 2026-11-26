@@ -1020,7 +1020,7 @@ public final class Iec61850Client implements AutoCloseable {
 
         private boolean startGi(Rcb rcb) throws IOException {
             // EntryID ile surdurulen BRCB'de GI istenmez: tampon kacan girdileri
-            // yollarken gelen GI gonderimi keser (libiec61850'de girdi atlandi);
+            // yollar; GI'li denemede libiec61850 bir girdiyi atladi (GI'sizde atlamadi);
             // guncel deger baglanirken okumayla zaten gelir.
             if (surdurulen.contains(rcb)) return true;
             try {
