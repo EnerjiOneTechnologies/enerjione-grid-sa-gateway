@@ -199,6 +199,26 @@ class Iec61850IedTest {
         assertTrue(of(IA.id(), "spontaneous").isEmpty()); // rapor yolu yok
     }
 
+    @Test
+    void ayni_LN_deki_noktalar_tek_turda_dogru_okunur() throws Exception {
+        // XCBR1: Pos + Beh (ST), MMXU1: A + TotW (MX) -> LN + FC duzeyinde tek istek.
+        // Sunucu LN okumasini reddederse DO basina okumaya duser; degerler iki
+        // yolda da dogru gelmeli.
+        start(base().withPollMs(300), List.of(POS, BEH, IA, TOTW));
+        waitFor(() -> !of(POS.id(), "interrogation").isEmpty() && !of(BEH.id(), "interrogation").isEmpty()
+                && !of(IA.id(), "interrogation").isEmpty() && !of(TOTW.id(), "interrogation").isEmpty(), 15_000);
+
+        ied.setPos(DoubleBitPos.ON, Validity.GOOD, Instant.parse("2026-11-26T10:00:00Z"));
+        ied.setPhsA(33.0f, Validity.GOOD, Instant.parse("2026-11-26T10:00:01Z"));
+        waitFor(() -> last(POS.id(), v -> "periodic".equals(v.cause()) && Double.valueOf(2.0).equals(v.value()))
+                .isPresent(), 5000);
+        waitFor(() -> last(IA.id(), v -> "periodic".equals(v.cause()) && Double.valueOf(33.0).equals(v.value()))
+                .isPresent(), 5000);
+        // Ayni turdaki komsu DO'lar da okunur (gecerli kalite, deger var).
+        assertTrue(last(BEH.id(), v -> "periodic".equals(v.cause()) && v.value() != null).isPresent());
+        assertTrue(last(TOTW.id(), v -> "periodic".equals(v.cause()) && v.value() != null).isPresent());
+    }
+
     private void waitInitial2NoInd() throws InterruptedException {
         waitFor(() -> !of(POS.id(), "interrogation").isEmpty() && !of(IA.id(), "interrogation").isEmpty(), 15_000);
     }
@@ -239,10 +259,33 @@ class Iec61850IedTest {
     }
 
     @Test
-    void tamponlu_ve_tamponsuz_rcb_birlikte_etkinlesir() throws Exception {
-        start(base().withRcbs(List.of(BRCB, URCB)), List.of(POS));
+    void ayni_kumede_brcb_varken_urcb_acilmaz() throws Exception {
+        // brcbStat ve urcbMeas ayni Ds1'i tasir: BRCB yeter. URCB de acilsaydi yeniden
+        // baglanmada canli raporu BRCB'nin kacan girdilerinden once gelirdi.
+        start(base().withRcbs(List.of(URCB, BRCB)), List.of(POS));
         waitFor(() -> !of(POS.id(), "interrogation").isEmpty(), 15_000);
-        waitFor(() -> handler.status().reportsEnabled() == 2, 5000);
+        waitFor(() -> handler.status().reportsEnabled() == 1, 5000);
+        try (TestIed.Client other = new TestIed.Client(ied.port())) {
+            assertTrue(other.enabled("brcbStat"));
+            assertFalse(other.enabled("urcbMeas01"));
+            assertFalse(other.reserved("urcbMeas01"));
+        }
+    }
+
+    @Test
+    void brcb_alinamazsa_urcb_yedek_olarak_acilir() throws Exception {
+        try (TestIed.Client other = new TestIed.Client(ied.port())) {
+            other.enable("brcbStat"); // BRCB baska istemcide
+            handler = new Iec61850Ied(1, "REL61850-Y", "fp", base().withRcbs(List.of(BRCB, URCB)), List.of(POS),
+                    got::add);
+            handler.rcbRetryMs(300);
+            handler.start();
+            waitFor(() -> handler.status().reportsEnabled() == 1, 15_000);
+            assertTrue(other.enabled("urcbMeas01")); // gateway'de
+            Instant t = Instant.parse("2026-11-27T08:00:00Z");
+            ied.setPos(DoubleBitPos.OFF, Validity.GOOD, t);
+            waitFor(() -> last(POS.id(), v -> "spontaneous".equals(v.cause())).isPresent(), 5000);
+        }
     }
 
     @Test
@@ -282,14 +325,13 @@ class Iec61850IedTest {
             assertTrue(other.enabled("brcbStat")); // simdi gateway'de
 
             other.release("urcbMeas02");
-            waitFor(() -> handler.status().reportsEnabled() == 2, 5000);
-            assertTrue(other.enabled("urcbMeas02"));
+            Thread.sleep(1000); // birkac yeniden deneme
+            // Ds1'i artik BRCB tasiyor: URCB acilmaz (rapor iki yoldan gelmesin).
+            assertEquals(1, handler.status().reportsEnabled());
+            assertFalse(other.enabled("urcbMeas02"));
             assertTrue(other.enabled("urcbMeas01")); // baska istemcinin blogu, dokunulmadi
-
-            Instant t = Instant.parse("2026-11-22T09:30:00Z");
-            ied.setPos(DoubleBitPos.OFF, Validity.GOOD, t);
-            waitFor(() -> last(POS.id(), v -> "spontaneous".equals(v.cause())).isPresent(), 5000);
-            assertEquals(t.toString(), last(POS.id(), v -> "spontaneous".equals(v.cause())).orElseThrow().ts());
+            // Not: iec61850bean sunucusu BRCB'den degisim raporu iletmez; raporla gelen
+            // deger ve zaman URCB testlerinde, BRCB raporu libiec61850 ile uctan uca sinandi.
         }
     }
 
@@ -319,14 +361,22 @@ class Iec61850IedTest {
 
     @Test
     void kapatilinca_RCBler_birakilir() throws Exception {
-        start(base().withRcbs(List.of(BRCB, URCB)), List.of(POS));
-        waitFor(() -> handler.status().reportsEnabled() == 2, 15_000);
+        // Ayni Ds1'i tasidiklari icin BRCB ve URCB birlikte acilmaz: ayri ayri sinanir.
+        start(base().withRcbs(List.of(BRCB)), List.of(POS));
+        waitFor(() -> handler.status().reportsEnabled() == 1, 15_000);
         try (TestIed.Client other = new TestIed.Client(ied.port())) {
             assertTrue(other.enabled("brcbStat"));
+            handler.close();
+            // Bean sunucusu BRCB'yi kendiliginden hic birakmaz.
+            assertFalse(other.enabled("brcbStat"));
+            assertEquals(0, handler.status().reportsEnabled());
+
+            handler = new Iec61850Ied(1, "REL61850", "fp", base().withRcbs(List.of(URCB)), List.of(POS), got::add);
+            handler.start();
+            waitFor(() -> handler.status().reportsEnabled() == 1, 15_000);
             assertTrue(other.enabled("urcbMeas01"));
             handler.close();
-            // Bean sunucusu BRCB'yi kendiliginden hic birakmaz; URCB'yi baglanti kopunca gec birakir.
-            assertFalse(other.enabled("brcbStat"));
+            // URCB'yi baglanti kopunca gec birakir; rezervasyonu da gateway iptal eder.
             assertFalse(other.enabled("urcbMeas01"));
             assertFalse(other.reserved("urcbMeas01"));
             assertEquals(0, handler.status().reportsEnabled());

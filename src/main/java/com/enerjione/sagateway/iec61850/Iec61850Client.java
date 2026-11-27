@@ -11,9 +11,11 @@ import com.beanit.iec61850bean.ClientAssociation;
 import com.beanit.iec61850bean.ClientEventListener;
 import com.beanit.iec61850bean.ClientSap;
 import com.beanit.iec61850bean.Fc;
+import com.beanit.iec61850bean.FcDataObject;
 import com.beanit.iec61850bean.FcModelNode;
 import com.beanit.iec61850bean.LogicalNode;
 import com.beanit.iec61850bean.ModelNode;
+import com.beanit.iec61850bean.ObjectReference;
 import com.beanit.iec61850bean.Rcb;
 import com.beanit.iec61850bean.Report;
 import com.beanit.iec61850bean.ServerModel;
@@ -73,6 +75,8 @@ public final class Iec61850Client implements AutoCloseable {
     private static final long RELEASE_BUDGET_MS = 3000;
     /** close(): oturumun RCB'leri birakmasi icin beklenen en uzun sure. */
     private static final long CLOSE_JOIN_MS = 5000;
+    /** Bu kadar oturum ust uste LN okumasinda zaman asimiyla biterse IED'de LN okumasi kapanir. */
+    private static final int LN_ZAMAN_ASIMI_SINIRI = 2;
 
     /**
      * Baglanti ayarlari. Alanlar Grid SA'daki IEC 61850 IED baglantisiyla ayni
@@ -216,6 +220,38 @@ public final class Iec61850Client implements AutoCloseable {
     /** Son yoklama turunun suresi (ms); yoklama yoksa -1. */
     private volatile long lastPollMs = -1;
     private volatile long rcbRetryMs = RCB_RETRY_MS;
+    /** LN okumasini reddeden LN + FC'ler ("LN|FC"); oturumlar arasi korunur. */
+    private final Set<String> lnRed = ConcurrentHashMap.newKeySet();
+    /** Ust uste kac oturum, hic LN okumasi basaramadan LN okumasinda zaman asimiyla bitti. */
+    private volatile int lnZamanAsimi;
+    /** LN okumasina yanit vermeyen IED: bu istemci boyunca DO basina okunur. */
+    private volatile boolean lnKapali;
+    /**
+     * Tamponlu RCB (BRCB) basina son alinan EntryID (brcbAnahtari(ornek referansi) -> bayt).
+     * Yeniden baglanmada etkinlestirmeden once yazilir: IED tamponu bastan degil
+     * kalinan yerden yollar (yalniz kopukken kacan girdiler gelir). Surec boyunca
+     * (IED ayari degisip istemci yeniden kurulsa da) tutulur; gateway yeniden
+     * baslarsa tampon bastan gelir, Grid ayni zaman etiketli ayni degeri tekrar sayar.
+     */
+    private static final Map<String, byte[]> SON_ENTRY_ID = new ConcurrentHashMap<>();
+    /** Grid BRCB adresi basina en son tutulan ornek (brcbAnahtari(grid adresi) -> ornek referansi). */
+    private static final Map<String, String> TUTULAN_BRCB = new ConcurrentHashMap<>();
+    /**
+     * Daha once tutulan BRCB ornegi mesgulse (IED onceki baglantiyi henuz dusurmedi)
+     * bu sure baska ornege gecilmez: tampon o ornekte. Sonra bos ornek alinir.
+     */
+    static final long BRCB_BEKLEME_MS = 60_000;
+    /** brcbAnahtari(grid adresi) -> tutulan ornegin mesgul goruldugu ilk an (nanoTime). */
+    private final Map<String, Long> brcbMesgulBas = new ConcurrentHashMap<>();
+
+    /**
+     * BRCB bellegi anahtari: IED kodu + adres + RCB. Adres degisirse baska cihazdir:
+     * eski EntryID yazilmaz (bazi sunucular bilinmeyen EntryID'yi reddetmeyip
+     * rapor gondermeyi birakir).
+     */
+    private String brcbAnahtari(String ref) {
+        return name + "|" + s.host() + ":" + s.port() + "|" + ref;
+    }
 
     public Iec61850Client(String name, Settings settings, List<Target> targets, Listener listener) {
         this.name = name;
@@ -436,6 +472,30 @@ public final class Iec61850Client implements AutoCloseable {
         }
     }
 
+    /**
+     * Ayni mantiksal dugum + FC'deki DO gruplari TEK istekle okunur (MMS "LN$FC").
+     * Olcum (kullanici simulatoru, 1116 sinyal / 1078 DO, 2026-11-26): DO basina tur
+     * ~9 sn, LN duzeyinde 202 istekle ~0,7 sn; degerler ayni. Yanit yapisi sunucunun
+     * LN'sindeki o FC'li TUM DO'lardir: istek de hepsini model sirasiyla tasir.
+     * Sunucu reddederse bu LN oturum boyunca DO basina okunur (eski yol).
+     */
+    private static final class LnGroup {
+        final String lnRef;
+        final Fc fc;
+        /** LN'deki bu FC'li tum DO'lar (yerel model, model sirasi). */
+        final List<FcModelNode> dos;
+        /** Izlenen DO gruplari (bu LN + FC). */
+        final List<Group> groups = new ArrayList<>();
+        /** LN okumasi reddedildi: oturum boyunca DO basina. */
+        boolean doBasina;
+
+        LnGroup(String lnRef, Fc fc, List<FcModelNode> dos) {
+            this.lnRef = lnRef;
+            this.fc = fc;
+            this.dos = dos;
+        }
+    }
+
     @FunctionalInterface
     private interface Request {
         void run() throws IOException, ServiceError;
@@ -453,6 +513,8 @@ public final class Iec61850Client implements AutoCloseable {
     /** tryEnable sonucu: reason null = etkin. */
     private record Attempt(String reason, boolean busy) {
         static final Attempt OK = new Attempt(null, false);
+        /** URCB'nin veri kumesini etkin bir BRCB zaten tasiyor: acilmaz (hata degil). */
+        static final Attempt YEDEK = new Attempt("veri kumesi tamponlu blokta (BRCB) zaten etkin", false);
 
         static Attempt busy(String reason) {
             return new Attempt(reason, true);
@@ -476,6 +538,17 @@ public final class Iec61850Client implements AutoCloseable {
         private final Map<String, List<Watched>> byQuality = new HashMap<>();
         private final Map<String, BasicDataAttribute> index = new HashMap<>();
         private final List<Group> groups = new ArrayList<>();
+        private final List<LnGroup> lnGroups = new ArrayList<>();
+        /** Bu oturumda en az bir LN okumasi basarili oldu (hat LN okumasini tasiyor). */
+        private boolean lnBasarili;
+        /**
+         * Etkin BRCB'nin veri kumesi -> BRCB referansi. Rapor blogu adini tasimaz;
+         * EntryID'si olan rapor (yalniz BRCB) veri kumesinden eslenir. Ayni kumeyi
+         * iki BRCB tasiyorsa "" (belirsiz: EntryID tutulmaz). Rapor is parcacigi okur.
+         */
+        private final Map<String, String> brcbByDataSet = new ConcurrentHashMap<>();
+        /** Bu oturumda EntryID ile kalinan yerden surdurulen BRCB'ler (GI istenmez). */
+        private final Set<Rcb> surdurulen = ConcurrentHashMap.newKeySet();
         // yalniz oturum is parcaciginda
         private final List<Rcb> enabled = new ArrayList<>();
         /** IED'de tutabilecegimiz bloklar (rezerve URCB, etkin ya da etkinlestirilmekte olan): kapanista birakilir. */
@@ -528,14 +601,18 @@ public final class Iec61850Client implements AutoCloseable {
                     readAll("periodic");
                     long sure = System.nanoTime() - t0;
                     lastPollMs = sure / 1_000_000;
+                    // Aralik turun BASINDAN sayilir: bir deger en gec bir aralik sonra
+                    // yeniden okunur (tur bitince bekleseydik gecikme aralik + tur olurdu).
                     // Tur araliktan uzun surduyse IED'ye ara vermeden istek gitmesin:
                     // sonraki tur en az bir tur suresi kadar bekler (IED ve ag korunur).
                     if (sure > pollNs) {
                         logOnce("poll_slow", Level.WARNING, "sa_poll_slow ied=" + name + " tur_ms=" + lastPollMs
                                 + " aralik_ms=" + s.pollMs() + " (sonraki tur ertelenir; noktalari azaltin ya da "
                                 + "rapor blogu kullanin)");
+                        nextPoll = System.nanoTime() + sure;
+                    } else {
+                        nextPoll = t0 + pollNs;
                     }
-                    nextPoll = System.nanoTime() + Math.max(pollNs, sure);
                 } else if (now - (lastActivity + keepNs) >= 0) {
                     probe();
                 }
@@ -654,6 +731,23 @@ public final class Iec61850Client implements AutoCloseable {
                     byGroup.computeIfAbsent(g.getReference() + "|" + g.getFc(), k -> new Group(g)).members.add(w);
                 }
                 groups.addAll(byGroup.values());
+                // LN + FC kumeleri (yoklama turu bunlarla okunur; bkz. LnGroup).
+                Map<String, LnGroup> byLn = new LinkedHashMap<>();
+                for (Group g : groups) {
+                    ModelNode ln = g.node.getParent();
+                    Fc fc = g.node.getFc();
+                    LnGroup l = byLn.computeIfAbsent(ln.getReference() + "|" + fc, k -> {
+                        List<FcModelNode> dos = new ArrayList<>();
+                        for (ModelNode d : ln.getChildren()) {
+                            if (d instanceof FcModelNode f && !(f instanceof Rcb) && f.getFc() == fc) dos.add(f);
+                        }
+                        LnGroup yeni = new LnGroup(ln.getReference().toString(), fc, dos);
+                        yeni.doBasina = lnRed.contains(yeni.lnRef + "|" + fc);
+                        return yeni;
+                    });
+                    l.groups.add(g);
+                }
+                lnGroups.addAll(byLn.values());
             }
         }
 
@@ -663,8 +757,16 @@ public final class Iec61850Client implements AutoCloseable {
 
         // ---- raporlar --------------------------------------------------------
 
+        /**
+         * BRCB'ler ONCE etkinlesir; ayni veri kumesini tasiyan URCB ancak BRCB
+         * alinamazsa acilir. Iki yoldan ayni veri gelince yeniden baglanmada URCB'nin
+         * canli raporlari BRCB'nin kacan girdilerinden once varip canli degeri bir an
+         * eski degerlere dondururdu; IED'nin istemci yuvasi da bosa gider.
+         */
         private void enableReports() throws IOException {
-            for (RcbRef r : s.rcbs()) {
+            List<RcbRef> sirali = new ArrayList<>(s.rcbs());
+            sirali.sort(Comparator.comparing((RcbRef r) -> !r.buffered()));
+            for (RcbRef r : sirali) {
                 if (enableRef(r, false) == RcbState.BUSY) pending.add(r);
             }
             rcbEnabled = enabled.size();
@@ -677,13 +779,28 @@ public final class Iec61850Client implements AutoCloseable {
             }
         }
 
-        /** Tek Grid adresi: adaylar sirayla denenir, ilk etkinlesen kullanilir. */
+        /**
+         * Tek Grid adresi: adaylar sirayla denenir, ilk etkinlesen kullanilir.
+         * BRCB'de daha once tutulan ornek once denenir; mesgulse BRCB_BEKLEME_MS
+         * boyunca baska ornege gecilmez (tampon ve EntryID o ornekte).
+         */
         private RcbState enableRef(RcbRef r, boolean retry) throws IOException {
             List<Rcb> candidates = candidates(r);
             if (candidates.isEmpty()) {
                 logOnce("nf|" + r, Level.WARNING, "sa_rcb_not_found ied=" + name + " rcb=" + r
                         + " (modelde yok; yoklama " + (s.pollMs() > 0 ? "var" : "YOK") + ")");
                 return RcbState.FAILED;
+            }
+            String anahtar = brcbAnahtari(r.toString());
+            String onceki = r.buffered() ? TUTULAN_BRCB.get(anahtar) : null;
+            if (onceki != null) {
+                candidates = new ArrayList<>(candidates);
+                for (int i = 0; i < candidates.size(); i++) {
+                    if (candidates.get(i).getReference().toString().equals(onceki)) {
+                        candidates.add(0, candidates.remove(i));
+                        break;
+                    }
+                }
             }
             String fail = null;
             boolean busy = false;
@@ -694,7 +811,26 @@ public final class Iec61850Client implements AutoCloseable {
                     continue;
                 }
                 Attempt at = tryEnable(rcb);
+                if (at == Attempt.YEDEK) {
+                    logOnce("yd|" + r, Level.INFO, "sa_rcb_skipped ied=" + name + " rcb=" + r + " (" + at.reason()
+                            + "; rapor iki yoldan gelmesin)");
+                    return RcbState.FAILED;
+                }
+                if (at.reason() != null && at.busy() && rcb.getReference().toString().equals(onceki)) {
+                    long bas = brcbMesgulBas.computeIfAbsent(anahtar, k -> System.nanoTime());
+                    if (System.nanoTime() - bas < BRCB_BEKLEME_MS * 1_000_000L) {
+                        logOnce("bw|" + r, Level.INFO, "sa_brcb_wait ied=" + name + " rcb=" + onceki
+                                + " (onceki baglantida tutuluyor; tampon bu ornekte, en cok "
+                                + BRCB_BEKLEME_MS / 1000 + " sn beklenir)");
+                        return RcbState.BUSY;
+                    }
+                }
                 if (at.reason() == null) {
+                    if (r.buffered()) {
+                        TUTULAN_BRCB.put(anahtar, rcb.getReference().toString());
+                        brcbMesgulBas.remove(anahtar);
+                        loggedOnce.remove("bw|" + r);
+                    }
                     loggedOnce.remove("ef|" + r);
                     LOG.info(() -> "sa_rcb_enabled ied=" + name + " rcb=" + rcb.getReference()
                             + (rcb instanceof Brcb ? " (BR)" : " (RP)") + " veri_kumesi="
@@ -771,6 +907,9 @@ public final class Iec61850Client implements AutoCloseable {
                 if (model.getDataSet(ds.replace('$', '.')) == null) {
                     return Attempt.failed("veri kumesi modelde yok: " + ds);
                 }
+                if (!buffered && !brcbByDataSet.getOrDefault(ds.replace('.', '$'), "").isEmpty()) {
+                    return Attempt.YEDEK;
+                }
                 // Yanit gelmeden kesilen istek IED'de uygulanmis olabilir: kapanista birakilsin.
                 // Reddedilirse listeden cikar; baska istemcinin blogu birakilmaz.
                 held.add(rcb);
@@ -782,11 +921,17 @@ public final class Iec61850Client implements AutoCloseable {
                         return Attempt.busy("rezerve edilemedi (baska istemcide olabilir): " + describe(e));
                     }
                 }
+                // Eslesme etkinlestirmeden ONCE: tampon girdileri hemen ardindan gelir.
+                String kume = ds.replace('.', '$');
+                String ref = rcb.getReference().toString();
+                if (buffered) brcbByDataSet.merge(kume, ref, (eski, yeni) -> eski.equals(yeni) ? eski : "");
                 try {
                     configure(rcb);
+                    if (buffered) resume((Brcb) rcb);
                     call(() -> assoc.enableReporting(rcb));
                 } catch (ServiceError e) {
                     if (!buffered) cancelQuietly((Urcb) rcb);
+                    if (buffered) brcbByDataSet.remove(kume, ref);
                     held.remove(rcb);
                     return Attempt.busy("etkinlestirilemedi: " + describe(e));
                 }
@@ -795,6 +940,29 @@ public final class Iec61850Client implements AutoCloseable {
             } catch (ServiceError e) {
                 return Attempt.failed(describe(e));
             }
+        }
+
+        /**
+         * BRCB'yi kalinan yerden surdurur: onceki oturumda alinan son EntryID
+         * yazilir, IED tampondan yalniz SONRAKI girdileri yollar. EntryID yoksa ya
+         * da IED reddederse (girdi tampondan dusmus) tampon bastan gelir.
+         */
+        private void resume(Brcb rcb) throws IOException {
+            String ref = rcb.getReference().toString();
+            byte[] id = SON_ENTRY_ID.get(brcbAnahtari(ref));
+            if (id == null || rcb.getEntryId() == null) return;
+            rcb.getEntryId().setValue(id.clone());
+            List<ServiceError> errs = assoc.setRcbValues(rcb, false, false, false, false, false, false, false, true);
+            touch();
+            for (ServiceError e : errs) {
+                if (e == null) continue;
+                if (e.getErrorCode() == ServiceError.TIMEOUT) throw new IOException("yanit gelmedi (EntryID)", e);
+                LOG.fine(() -> "sa_brcb_resume_rejected ied=" + name + " rcb=" + ref + " " + describe(e)
+                        + " (tampon bastan gelir)");
+                return;
+            }
+            surdurulen.add(rcb);
+            LOG.fine(() -> "sa_brcb_resumed ied=" + name + " rcb=" + ref);
         }
 
         private void cancelQuietly(Urcb urcb) throws IOException {
@@ -847,6 +1015,11 @@ public final class Iec61850Client implements AutoCloseable {
                     of.setReportTimestamp(true);
                     ofCh = true;
                 }
+                // BRCB: kalinan yerden surdurmek icin raporda EntryID gerekir.
+                if (rcb instanceof Brcb && !of.isEntryId()) {
+                    of.setEntryId(true);
+                    ofCh = true;
+                }
             }
             if (!trCh && !ofCh) return;
             List<ServiceError> errs = assoc.setRcbValues(rcb, false, false, ofCh, false, trCh, false, false, false);
@@ -873,6 +1046,10 @@ public final class Iec61850Client implements AutoCloseable {
         }
 
         private boolean startGi(Rcb rcb) throws IOException {
+            // EntryID ile surdurulen BRCB'de GI istenmez: tampon kacan girdileri
+            // yollar; GI'li denemede libiec61850 bir girdiyi atladi (GI'sizde atlamadi);
+            // guncel deger baglanirken okumayla zaten gelir.
+            if (surdurulen.contains(rcb)) return true;
             try {
                 call(() -> assoc.startGi(rcb));
                 return true;
@@ -915,6 +1092,11 @@ public final class Iec61850Client implements AutoCloseable {
                 }
                 hit.forEach(this::emit);
             }
+            // Isleme bittikten sonra: bu girdi alindi, yeniden baglanmada sonrakinden surer.
+            if (report.getEntryId() != null && report.getEntryId().getValue() != null && report.getDataSetRef() != null) {
+                String ref = brcbByDataSet.get(report.getDataSetRef().replace('.', '$'));
+                if (ref != null && !ref.isEmpty()) SON_ENTRY_ID.put(brcbAnahtari(ref), report.getEntryId().getValue().clone());
+            }
         }
 
         private String cause(BdaReasonForInclusion r) {
@@ -933,9 +1115,63 @@ public final class Iec61850Client implements AutoCloseable {
         // ---- okuma -----------------------------------------------------------
 
         private void readAll(String cause) throws IOException {
-            for (Group g : groups) {
+            for (LnGroup l : lnGroups) {
                 if (stopped) return;
-                readGroup(g, cause);
+                // Tek izlenen DO'lu LN'de LN okumasi istek kazandirmaz (fazla veri tasir).
+                if (lnKapali || l.doBasina || l.groups.size() < 2) {
+                    for (Group g : l.groups) {
+                        if (stopped) return;
+                        readGroup(g, cause);
+                    }
+                } else {
+                    readLn(l, cause);
+                }
+            }
+        }
+
+        /**
+         * LN + FC tek istek. Reddedilirse bu LN (yeniden baglanmalarda da) DO basina
+         * okunur. Zaman asiminda iliski her durumda yeniden kurulur (call); oturumda hic
+         * LN okumasi basarmadiysa sayilir, ust uste LN_ZAMAN_ASIMI_SINIRI oturum boyle
+         * biterse bu IED'de LN okumasi kapanir. Basarili LN okumasindan sonraki hat
+         * kopmasi sayilmaz.
+         */
+        private void readLn(LnGroup l, String cause) throws IOException {
+            List<FcModelNode> kopyalar = new ArrayList<>(l.dos.size());
+            for (FcModelNode d : l.dos) kopyalar.add((FcModelNode) d.copy());
+            FcDataObject istek = new FcDataObject(new ObjectReference(l.lnRef), l.fc, kopyalar);
+            try {
+                call(() -> assoc.getDataValues(istek));
+            } catch (IOException e) {
+                if (!lnBasarili && e.getCause() instanceof ServiceError se && se.getErrorCode() == ServiceError.TIMEOUT
+                        && ++lnZamanAsimi >= LN_ZAMAN_ASIMI_SINIRI && !lnKapali) {
+                    lnKapali = true;
+                    LOG.warning(() -> "sa_iec61850_ln_read_off ied=" + name + " (LN okumasi " + lnZamanAsimi
+                            + " oturumdur yanitsiz; DO basina okunur)");
+                }
+                throw e;
+            } catch (ServiceError | RuntimeException e) {
+                l.doBasina = true;
+                lnRed.add(l.lnRef + "|" + l.fc);
+                logOnce("ln|" + l.lnRef + l.fc, Level.FINE, "sa_iec61850_ln_read_failed ied=" + name + " ln="
+                        + l.lnRef + " fc=" + l.fc + " " + (e instanceof ServiceError se ? describe(se) : e.toString())
+                        + " (DO basina okunur)");
+                for (Group g : l.groups) {
+                    if (stopped) return;
+                    readGroup(g, cause);
+                }
+                return;
+            }
+            lnBasarili = true;
+            lnZamanAsimi = 0;
+            synchronized (lock) {
+                for (int i = 0; i < l.dos.size(); i++) apply(l.dos.get(i), kopyalar.get(i));
+                for (Group g : l.groups) {
+                    for (Watched w : g.members) {
+                        loggedOnce.remove("rf|" + w.target.key());
+                        emit(w, cause);
+                    }
+                }
             }
         }
 

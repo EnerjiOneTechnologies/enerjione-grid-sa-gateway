@@ -394,20 +394,21 @@ class GatewayTest {
         try (TestIed ied = new TestIed()) {
             config = config61850(ied.port(), "v1", pos);
             startGateway(TOKEN);
-            waitFor(() -> ied61850().path("rcb_enabled").asInt() == 2, 15000);
+            // brcbStat ve urcbMeas ayni Ds1'i tasir: yalniz BRCB acilir (rapor iki yoldan gelmesin).
+            waitFor(() -> ied61850().path("rcb_enabled").asInt() == 1, 15000);
             try (TestIed.Client other = new TestIed.Client(ied.port())) {
                 assertTrue(other.enabled("brcbStat"));
-                assertTrue(other.enabled("urcbMeas01"));
+                assertFalse(other.enabled("urcbMeas01"));
                 assertFalse(other.enabled("urcbMeas02"));
 
                 // Grid noktalari degistirir: IED durdurulur ve hemen yeniden kurulur.
                 config = config61850(ied.port(), "v2", pos + "," + ia);
                 waitFor(() -> ied61850().path("points").asInt() == 2
-                        && ied61850().path("rcb_enabled").asInt() == 2, 15000);
-                // Eski iliski bloklari birakti: ayni BRCB ve ayni URCB ornegi yeniden alindi.
+                        && ied61850().path("rcb_enabled").asInt() == 1, 15000);
+                // Eski iliski BRCB'yi birakti: ayni BRCB yeniden alindi.
                 assertTrue(other.enabled("brcbStat"));
-                assertTrue(other.enabled("urcbMeas01"));
-                assertFalse(other.enabled("urcbMeas02"));
+                assertFalse(other.enabled("urcbMeas01"));
+                assertFalse(other.reserved("urcbMeas01"));
                 assertFalse(other.reserved("urcbMeas02"));
                 assertTrue(ied61850().path("connected").asBoolean());
                 assertEquals("", ied61850().path("last_error").asText());
@@ -420,10 +421,10 @@ class GatewayTest {
 
                 // Ayni sunucuya yeni bir IED: ayni bloklari alir.
                 config = config61850(ied.port(), "v4", 4, "T61850B", pos);
-                waitFor(() -> ied61850().path("rcb_enabled").asInt() == 2, 15000);
+                waitFor(() -> ied61850().path("rcb_enabled").asInt() == 1, 15000);
                 assertEquals("T61850B", ied61850().path("code").asText());
                 assertTrue(other.enabled("brcbStat"));
-                assertTrue(other.enabled("urcbMeas01"));
+                assertFalse(other.enabled("urcbMeas01"));
                 assertFalse(other.enabled("urcbMeas02"));
             }
         }
