@@ -227,22 +227,31 @@ public final class Iec61850Client implements AutoCloseable {
     /** LN okumasina yanit vermeyen IED: bu istemci boyunca DO basina okunur. */
     private volatile boolean lnKapali;
     /**
-     * Tamponlu RCB (BRCB) basina son alinan EntryID ("IED|ornek referansi" -> bayt).
+     * Tamponlu RCB (BRCB) basina son alinan EntryID (brcbAnahtari(ornek referansi) -> bayt).
      * Yeniden baglanmada etkinlestirmeden once yazilir: IED tamponu bastan degil
      * kalinan yerden yollar (yalniz kopukken kacan girdiler gelir). Surec boyunca
      * (IED ayari degisip istemci yeniden kurulsa da) tutulur; gateway yeniden
      * baslarsa tampon bastan gelir, Grid ayni zaman etiketli ayni degeri tekrar sayar.
      */
     private static final Map<String, byte[]> SON_ENTRY_ID = new ConcurrentHashMap<>();
-    /** Grid BRCB adresi basina en son tutulan ornek ("IED|grid adresi" -> ornek referansi). */
+    /** Grid BRCB adresi basina en son tutulan ornek (brcbAnahtari(grid adresi) -> ornek referansi). */
     private static final Map<String, String> TUTULAN_BRCB = new ConcurrentHashMap<>();
     /**
      * Daha once tutulan BRCB ornegi mesgulse (IED onceki baglantiyi henuz dusurmedi)
      * bu sure baska ornege gecilmez: tampon o ornekte. Sonra bos ornek alinir.
      */
     static final long BRCB_BEKLEME_MS = 60_000;
-    /** "IED|grid adresi" -> tutulan ornegin mesgul goruldugu ilk an (nanoTime). */
+    /** brcbAnahtari(grid adresi) -> tutulan ornegin mesgul goruldugu ilk an (nanoTime). */
     private final Map<String, Long> brcbMesgulBas = new ConcurrentHashMap<>();
+
+    /**
+     * BRCB bellegi anahtari: IED kodu + adres + RCB. Adres degisirse baska cihazdir:
+     * eski EntryID yazilmaz (bazi sunucular bilinmeyen EntryID'yi reddetmeyip
+     * rapor gondermeyi birakir).
+     */
+    private String brcbAnahtari(String ref) {
+        return name + "|" + s.host() + ":" + s.port() + "|" + ref;
+    }
 
     public Iec61850Client(String name, Settings settings, List<Target> targets, Listener listener) {
         this.name = name;
@@ -504,6 +513,8 @@ public final class Iec61850Client implements AutoCloseable {
     /** tryEnable sonucu: reason null = etkin. */
     private record Attempt(String reason, boolean busy) {
         static final Attempt OK = new Attempt(null, false);
+        /** URCB'nin veri kumesini etkin bir BRCB zaten tasiyor: acilmaz (hata degil). */
+        static final Attempt YEDEK = new Attempt("veri kumesi tamponlu blokta (BRCB) zaten etkin", false);
 
         static Attempt busy(String reason) {
             return new Attempt(reason, true);
@@ -746,8 +757,16 @@ public final class Iec61850Client implements AutoCloseable {
 
         // ---- raporlar --------------------------------------------------------
 
+        /**
+         * BRCB'ler ONCE etkinlesir; ayni veri kumesini tasiyan URCB ancak BRCB
+         * alinamazsa acilir. Iki yoldan ayni veri gelince yeniden baglanmada URCB'nin
+         * canli raporlari BRCB'nin kacan girdilerinden once varip canli degeri bir an
+         * eski degerlere dondururdu; IED'nin istemci yuvasi da bosa gider.
+         */
         private void enableReports() throws IOException {
-            for (RcbRef r : s.rcbs()) {
+            List<RcbRef> sirali = new ArrayList<>(s.rcbs());
+            sirali.sort(Comparator.comparing((RcbRef r) -> !r.buffered()));
+            for (RcbRef r : sirali) {
                 if (enableRef(r, false) == RcbState.BUSY) pending.add(r);
             }
             rcbEnabled = enabled.size();
@@ -772,7 +791,7 @@ public final class Iec61850Client implements AutoCloseable {
                         + " (modelde yok; yoklama " + (s.pollMs() > 0 ? "var" : "YOK") + ")");
                 return RcbState.FAILED;
             }
-            String anahtar = name + "|" + r;
+            String anahtar = brcbAnahtari(r.toString());
             String onceki = r.buffered() ? TUTULAN_BRCB.get(anahtar) : null;
             if (onceki != null) {
                 candidates = new ArrayList<>(candidates);
@@ -792,6 +811,11 @@ public final class Iec61850Client implements AutoCloseable {
                     continue;
                 }
                 Attempt at = tryEnable(rcb);
+                if (at == Attempt.YEDEK) {
+                    logOnce("yd|" + r, Level.INFO, "sa_rcb_skipped ied=" + name + " rcb=" + r + " (" + at.reason()
+                            + "; rapor iki yoldan gelmesin)");
+                    return RcbState.FAILED;
+                }
                 if (at.reason() != null && at.busy() && rcb.getReference().toString().equals(onceki)) {
                     long bas = brcbMesgulBas.computeIfAbsent(anahtar, k -> System.nanoTime());
                     if (System.nanoTime() - bas < BRCB_BEKLEME_MS * 1_000_000L) {
@@ -883,6 +907,9 @@ public final class Iec61850Client implements AutoCloseable {
                 if (model.getDataSet(ds.replace('$', '.')) == null) {
                     return Attempt.failed("veri kumesi modelde yok: " + ds);
                 }
+                if (!buffered && !brcbByDataSet.getOrDefault(ds.replace('.', '$'), "").isEmpty()) {
+                    return Attempt.YEDEK;
+                }
                 // Yanit gelmeden kesilen istek IED'de uygulanmis olabilir: kapanista birakilsin.
                 // Reddedilirse listeden cikar; baska istemcinin blogu birakilmaz.
                 held.add(rcb);
@@ -922,7 +949,7 @@ public final class Iec61850Client implements AutoCloseable {
          */
         private void resume(Brcb rcb) throws IOException {
             String ref = rcb.getReference().toString();
-            byte[] id = SON_ENTRY_ID.get(name + "|" + ref);
+            byte[] id = SON_ENTRY_ID.get(brcbAnahtari(ref));
             if (id == null || rcb.getEntryId() == null) return;
             rcb.getEntryId().setValue(id.clone());
             List<ServiceError> errs = assoc.setRcbValues(rcb, false, false, false, false, false, false, false, true);
@@ -1068,7 +1095,7 @@ public final class Iec61850Client implements AutoCloseable {
             // Isleme bittikten sonra: bu girdi alindi, yeniden baglanmada sonrakinden surer.
             if (report.getEntryId() != null && report.getEntryId().getValue() != null && report.getDataSetRef() != null) {
                 String ref = brcbByDataSet.get(report.getDataSetRef().replace('.', '$'));
-                if (ref != null && !ref.isEmpty()) SON_ENTRY_ID.put(name + "|" + ref, report.getEntryId().getValue().clone());
+                if (ref != null && !ref.isEmpty()) SON_ENTRY_ID.put(brcbAnahtari(ref), report.getEntryId().getValue().clone());
             }
         }
 
